@@ -1,0 +1,76 @@
+services:
+  # ==============================
+  # OpenClaw AI Gateway Core
+  # ==============================
+  openclaw-core:
+    image: ghcr.io/openclaw/openclaw:latest
+    container_name: openclaw-core
+    restart: unless-stopped
+    networks:
+      - openclaw-net
+    volumes:
+      - ./config/openclaw.json:/home/node/.openclaw/openclaw.json:ro
+      - ./data/agents:/home/node/.openclaw/agents
+      - ./data/workspace:/home/node/.openclaw/workspace
+      - ./logs/openclaw:/home/node/.openclaw/logs
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - LINE_CHANNEL_ACCESS_TOKEN=${LINE_CHANNEL_ACCESS_TOKEN}
+      - LINE_CHANNEL_SECRET=${LINE_CHANNEL_SECRET}
+      - GATEWAY_AUTH_TOKEN=${GATEWAY_AUTH_TOKEN}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - TZ=${TZ:-Asia/Taipei}
+    ports:
+      - "127.0.0.1:18789:18789"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ==============================
+  # Caddy HTTPS 反向代理
+  # ==============================
+  caddy:
+    image: caddy:2-alpine
+    container_name: openclaw-caddy
+    restart: unless-stopped
+    networks:
+      - openclaw-net
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/certs:/data/caddy
+      - ./logs/caddy:/var/log/caddy
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+      - TZ=${TZ:-Asia/Taipei}
+
+  # ==============================
+  # ADB Bridge — 云手机 HTTP 控制桥
+  # ==============================
+  adb-bridge:
+    build: ./services/adb-bridge
+    image: openclaw-adb-bridge:local
+    container_name: openclaw-adb-bridge
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./data:/app/data
+    environment:
+      - ANDROID_ADB_SERVER_ADDRESS=127.0.0.1
+      - TZ=Asia/Taipei
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8899/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  openclaw-net:
+    driver: bridge
+    name: openclaw-net
