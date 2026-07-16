@@ -48,4 +48,6 @@ clean:
 	@echo "进度已清零"
 
 report:
+push:
+	@bash scripts/push_report.sh
 	@bash scripts/report.sh
