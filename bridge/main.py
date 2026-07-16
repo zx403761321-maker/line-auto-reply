@@ -18,7 +18,7 @@ LINE_PACKAGE = "jp.naver.line.android"
 DEVICES_FILE = "/app/data/devices.json"
 DEVICES = {
     "cloud-01": {
-        "addr": "39.109.41.52:499",
+        "addr": "your-cloud-phone-ip:499",
         "type": "cloud",
         "label": "云手机-OPPO",
     }
@@ -29,7 +29,7 @@ if os.path.exists(DEVICES_FILE):
         with open(DEVICES_FILE) as f:
             saved = json.load(f)
             for dev_id, info in saved.items():
-                if True:  # 文件数据覆盖
+                if dev_id not in DEVICES:
                     DEVICES[dev_id] = info
         logger.info("从文件加载设备: %s", list(saved.keys()))
     except:
@@ -467,11 +467,6 @@ def line_add_friend_by_id():
     # 7. 检查结果（用 u2 不用 adb dump）
     xd = get_u2(device_addr)
     xd_xml = xd.dump_hierarchy()
-    if "搜索次数已达上限" in xd_xml or "暂时不能使用ID搜索" in xd_xml:
-        steps.append("search_limit")
-        lock.release()
-        return jsonify({"ok": False, "steps": steps, "line_id": line_id,
-                        "error": "search_limit"})
     if "未找到" in xd_xml:
         steps.append("no_result")
         lock.release()
@@ -993,3 +988,22 @@ if __name__ == "__main__":
     logger.info("ADB Bridge v2 (多设备) 启动在 :8899")
     from waitress import serve
     serve(app, host="0.0.0.0", port=8899, threads=8)
+
+# ─── 内置定时器 ───
+import threading, subprocess as _sp
+from datetime import datetime as _dt
+
+def _scheduler_loop():
+    last = {}
+    while True:
+        now = _dt.now().strftime('%H:%M')
+        today = _dt.now().strftime('%Y-%m-%d')
+        for at, cmd in [('08:00','make -C /root/line-crm start'),('09:30','bash /root/line-crm/scripts/report.sh')]:
+            if now == at and last.get(at) != today:
+                last[at] = today
+                try: _sp.run(cmd, shell=True, timeout=600)
+                except: pass
+        import time; time.sleep(30)
+
+_t = threading.Thread(target=_scheduler_loop, daemon=True)
+_t.start()

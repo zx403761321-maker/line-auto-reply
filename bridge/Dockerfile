@@ -23,3 +23,4 @@ COPY . .
 EXPOSE 8899
 
 CMD ["python", "main.py"]
+COPY scheduler.py .

@@ -1,36 +1,24 @@
 # 部署指南
 
-## 前提
-- 新服务器能访问云手机 ADB 端口
-- 已安装 Docker
+## 一键部署
 
-## 部署步骤
-
-### 1. 拷贝项目
 ```bash
+# 1. 拷贝
 scp -r /root/line-crm user@新服务器:/root/
-```
 
-### 2. 构建 Bridge
-```bash
-cd /root/line-crm && docker build -t openclaw-adb-bridge:local .
-```
+# 2. 改配置
+#    bridge/devices.json → 云手机ADB地址
+#    data/targets/targets_all.txt → LINE ID名单
 
-### 3. 启动
-```bash
+# 3. 构建+启动
+cd /root/line-crm && make build
 docker run -d --name openclaw-adb-bridge \
-  --restart=always \
-  --network host \
-  -v /root/line-crm/data/devices.json:/app/data/devices.json \
+  --restart=always --network host \
+  -v /root/line-crm/data:/app/data \
+  -v /root/line-crm/logs:/root/line-crm/logs \
+  -v /root/line-crm/scripts:/root/line-crm/scripts \
+  -v /root/line-crm/Makefile:/root/line-crm/Makefile \
   openclaw-adb-bridge:local
-
-### 4. 设置定时
-```bash
-crontab -e
-# 加入: 3 8 * * * make -C /root/line-crm start
-# 加入: 30 9 * * * bash /root/line-crm/scripts/report.sh
-
-### 5. 验证
-```bash
-make -C /root/line-crm health
 ```
+
+定时已内置在 Docker 里，不需要额外设置。
