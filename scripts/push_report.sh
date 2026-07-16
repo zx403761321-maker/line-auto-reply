@@ -2,7 +2,7 @@
 # 生成日报并推送到 LINE
 
 REPORT_BRIDGE="http://127.0.0.1:8899"
-REPORT_DEVICE="cloud-01"
+REPORT_DEVICE="cloud-06"
 REPORT_CHAT="dgxycu2840t050"
 
 # 生成报告文本
