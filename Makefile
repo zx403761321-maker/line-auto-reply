@@ -46,3 +46,6 @@ health:
 clean:
 	@rm -f data/state/targets_position_shared
 	@echo "进度已清零"
+
+report:
+	@bash scripts/report.sh
