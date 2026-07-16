@@ -998,7 +998,7 @@ def _scheduler_loop():
     while True:
         now = _dt.now().strftime('%H:%M')
         today = _dt.now().strftime('%Y-%m-%d')
-        for at, cmd in [('08:00','make -C /root/line-crm start'),('09:30','bash /root/line-crm/scripts/report.sh')]:
+        for at, cmd in [('08:00','bash /root/line-crm/scripts/launch.sh'),('09:30','bash /root/line-crm/scripts/report.sh')]:
             if now == at and last.get(at) != today:
                 last[at] = today
                 try: _sp.run(cmd, shell=True, timeout=600)

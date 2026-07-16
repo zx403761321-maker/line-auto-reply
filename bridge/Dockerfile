@@ -3,7 +3,7 @@ FROM python:3.11-slim
 # 系统依赖（宿主 ADB 运行时所需）
 RUN apt-get update && apt-get install -y \
     libusb-1.0-0 libbrotli1 liblz4-1 libprotobuf32t64 \
-    libzstd1 libudev1 libcap2 libxxhash0 curl \
+    libzstd1 libudev1 libcap2 libxxhash0 curl make \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
