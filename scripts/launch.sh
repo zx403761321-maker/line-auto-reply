@@ -1,6 +1,6 @@
 #!/bin/bash
 # 生产桥 8899
-PROD_DEVICES="cloud-01 cloud-06 cloud-07 cloud-08 cloud-09"
+PROD_DEVICES="cloud-01 cloud-06 cloud-07 cloud-08 cloud-09 cloud-10"
 # 测试桥 8898 (坐标适配)
 TEST_DEVICES=""
 
