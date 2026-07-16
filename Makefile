@@ -51,3 +51,7 @@ report:
 push:
 	@bash scripts/push_report.sh
 	@bash scripts/report.sh
+
+build:
+	@cd bridge && docker build -t openclaw-adb-bridge:local .
+	@echo "✅ Bridge 镜像构建完成"
