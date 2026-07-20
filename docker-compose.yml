@@ -62,6 +62,7 @@ services:
       - ./data:/app/data
     environment:
       - ANDROID_ADB_SERVER_ADDRESS=127.0.0.1
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - TZ=Asia/Taipei
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8899/health"]
@@ -69,6 +70,11 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 networks:
   openclaw-net:

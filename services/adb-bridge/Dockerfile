@@ -22,4 +22,4 @@ COPY . .
 
 EXPOSE 8899
 
-CMD sh -c "python -u /app/loop.py > /tmp/loop.log 2>&1 & exec python main.py"
+CMD ["python", "main.py"]
