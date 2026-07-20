@@ -1,0 +1,23 @@
+# LINE CRM 依赖
+# 安装: pip install -r requirements.txt
+
+# 核心
+uiautomator2>=3.5.0
+requests>=2.25.0
+pyyaml>=6.0
+
+# 总控 API（后续启用）
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+pydantic>=2.0.0
+
+# 队列/存储（后续启用）
+redis>=5.0.0
+psycopg2-binary>=2.9.0
+
+# AI（后续启用）
+anthropic>=0.30.0
+openai>=1.0.0
+
+# 工具
+python-dotenv>=1.0.0
