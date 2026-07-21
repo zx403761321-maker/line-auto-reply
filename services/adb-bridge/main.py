@@ -7,6 +7,7 @@ import uiautomator2 as u2
 from flask import Flask, request, jsonify
 
 from logger import device_log, device_error, system_log, timed
+from db import init_db, record_device_status, record_task, record_reply
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [adb-bridge] %(message)s")
@@ -118,16 +119,100 @@ def adb_raw(device_addr: str, *args, timeout=None):
         return {"ok": False, "stdout_bytes": b"", "stderr": str(e)}
 
 
-def ensure_connected(device_addr: str) -> bool:
-    """确保 ADB 连接"""
+def ensure_connected(device_addr: str, max_retries: int = 3) -> bool:
+    """确保 ADB 连接，指数退避重连
+    重试间隔: 2s → 4s → 8s，最多 3 次
+    """
     r = adb(device_addr, "shell", "echo", "ok", timeout=5)
     if r["ok"] and "ok" in r["stdout"]:
         return True
-    logger.warning("ADB 断开 [%s]，尝试重连...", device_addr)
-    subprocess.run([ADB_CMD, "connect", device_addr], capture_output=True, timeout=5)
-    time.sleep(2)
-    r2 = adb(device_addr, "shell", "echo", "ok", timeout=5)
-    return r2["ok"] and "ok" in r2["stdout"]
+
+    for attempt in range(1, max_retries + 1):
+        wait_s = 2 ** attempt  # 2, 4, 8 秒指数退避
+        logger.warning("ADB 断开 [%s]，第 %d/%d 次重连 (等待 %ds)...",
+                       device_addr, attempt, max_retries, wait_s)
+        subprocess.run([ADB_CMD, "connect", device_addr], capture_output=True, timeout=10)
+        time.sleep(wait_s)
+        r = adb(device_addr, "shell", "echo", "ok", timeout=5)
+        if r["ok"] and "ok" in r["stdout"]:
+            logger.info("ADB 重连成功 [%s] (第%d次)", device_addr, attempt)
+            return True
+
+    logger.error("ADB 重连失败 [%s] (已重试%d次)", device_addr, max_retries)
+    return False
+
+
+# ─── DeepSeek API 连接池 + 指数退避重试 ───
+_deepseek_session = None
+_deepseek_lock = threading.Lock()
+
+
+def _get_deepseek_session() -> requests.Session:
+    """获取/创建 DeepSeek API 连接池 Session（复用 TCP 连接）"""
+    global _deepseek_session
+    if _deepseek_session is None:
+        with _deepseek_lock:
+            if _deepseek_session is None:
+                _deepseek_session = requests.Session()
+                adapter = requests.adapters.HTTPAdapter(
+                    pool_connections=3,
+                    pool_maxsize=10,
+                    max_retries=0,  # 我们自己控制重试
+                )
+                _deepseek_session.mount("https://", adapter)
+                logger.info("DeepSeek 连接池已初始化 (pool=3/10)")
+    return _deepseek_session
+
+
+def deepseek_chat(messages: list, max_tokens: int = 80,
+                  timeout: int = 30, max_retries: int = 3) -> str:
+    """DeepSeek API 调用，带连接池复用 + 指数退避重试
+    重试间隔: 2s → 4s → 8s，遇 429 限流同样退避
+    """
+    session = _get_deepseek_session()
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = session.post(
+                "https://api.deepseek.com/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "deepseek-chat",
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                },
+                timeout=timeout,
+            )
+            if resp.status_code == 429:
+                wait_s = 2 ** attempt
+                logger.warning("DeepSeek 限流(429)，%ds 后退避重试 (第%d/%d次)",
+                               wait_s, attempt, max_retries)
+                time.sleep(wait_s)
+                continue
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"].strip()
+            return content
+        except requests.exceptions.Timeout:
+            last_error = "timeout"
+            if attempt < max_retries:
+                wait_s = 2 ** attempt
+                logger.warning("DeepSeek 超时，%ds 后重试 (第%d/%d次)",
+                               wait_s, attempt, max_retries)
+                time.sleep(wait_s)
+        except Exception as e:
+            last_error = str(e)[:100]
+            if attempt < max_retries:
+                wait_s = 2 ** attempt
+                logger.warning("DeepSeek 调用失败: %s，%ds 后重试 (第%d/%d次)",
+                               last_error, wait_s, attempt, max_retries)
+                time.sleep(wait_s)
+
+    raise Exception(f"DeepSeek API 重试耗尽 (last_error={last_error})")
 
 
 def ui_find(device_addr: str, text_contains: str, timeout=3):
@@ -312,6 +397,12 @@ def health():
 
     healthy = sum(1 for d in results.values() if d["connected"])
     all_ok = healthy == len(DEVICES)
+    # 记录每台设备状态到 SQLite
+    for dev_id, info in DEVICES.items():
+        r = results.get(dev_id, {})
+        record_device_status(dev_id, info["addr"],
+                            "online" if r.get("connected") else "offline",
+                            detail="health_check")
     return jsonify({
         "ok": all_ok,
         "status": "live" if all_ok else "degraded",
@@ -613,6 +704,10 @@ def line_add_friend_by_id():
         last_step = steps[-1] if steps else "none"
         device_log(device_addr, "add_friend", duration_ms=dt_ms,
                    line_id=line_id[:20], steps=len(steps), last_step=last_step)
+        record_task(device_addr, device_addr, "add_friend",
+                    status="ok" if last_step in ("greeted", "renamed") else "failed",
+                    line_id=line_id, steps=len(steps), last_step=last_step,
+                    duration_ms=dt_ms)
         lock.release()
     return jsonify({"ok": True, "steps": steps, "line_id": line_id, "device": device_addr})
 
@@ -809,17 +904,12 @@ def check_latest_chat():
                 reply = "你好"
             else:
                 try:
-                    resp = requests.post("https://api.deepseek.com/chat/completions",
-                        headers={"Authorization": f"Bearer {os.environ.get('DEEPSEEK_API_KEY', '')}","Content-Type": "application/json"},
-                        json={"model": "deepseek-chat",
-                            "messages": [
-                                {"role": "system", "content": "你是環球貸款小助理。用繁體中文回覆2-3句話，語氣親切像朋友聊天。\n\n公司資訊：\n- 申請網址：https://dorrj.com\n- 官方LINE：@583gyplg\n- 首貸最高50000元\n- 全程線上審批30-60分鐘，通過即撥款，不照會\n\n標準方案（8~10天）：\n- 借10000實撥7000\n- 借20000實撥14000\n- 借30000實撥21000\n\n官方LINE審核方案（7天）：\n- 借5000實撥3000 / 借7000實撥4000 / 借10000實撥6000\n- 到期日18:00前還款，遲繳10%罰款，逾期每日15%\n\n客戶有意申請時，引導提供：姓名、電話、身份證字號、居住地址、公司名稱、公司電話、在職時間、每月收入、薪轉勞保、申請金額、資金用途。引導客戶點擊網址 https://dorrj.com 申請，或添加官方LINE @583gyplg。\n\n注意事項：\n- 還款僅轉帳與超商代碼繳費\n- 不主動降價、不承諾一定通過、不提前收費\n- 不要發送身份驗證流程（身分證/自拍影片）除非對方已提交基本資料"},
-
-
-                                {"role": "user", "content": last_msg}
-                            ], "max_tokens": 80}, timeout=30)
-                    reply = resp.json()["choices"][0]["message"]["content"].strip()
-                except:
+                    reply = deepseek_chat([
+                        {"role": "system", "content": "你是環球貸款小助理。用繁體中文回覆2-3句話，語氣親切像朋友聊天。\n\n公司資訊：\n- 申請網址：https://dorrj.com\n- 官方LINE：@583gyplg\n- 首貸最高50000元\n- 全程線上審批30-60分鐘，通過即撥款，不照會\n\n標準方案（8~10天）：\n- 借10000實撥7000\n- 借20000實撥14000\n- 借30000實撥21000\n\n官方LINE審核方案（7天）：\n- 借5000實撥3000 / 借7000實撥4000 / 借10000實撥6000\n- 到期日18:00前還款，遲繳10%罰款，逾期每日15%\n\n客戶有意申請時，引導提供：姓名、電話、身份證字號、居住地址、公司名稱、公司電話、在職時間、每月收入、薪轉勞保、申請金額、資金用途。引導客戶點擊網址 https://dorrj.com 申請，或添加官方LINE @583gyplg。\n\n注意事項：\n- 還款僅轉帳與超商代碼繳費\n- 不主動降價、不承諾一定通過、不提前收費\n- 不要發送身份驗證流程（身分證/自拍影片）除非對方已提交基本資料"},
+                        {"role": "user", "content": last_msg}
+                    ], max_tokens=80, timeout=30)
+                except Exception as e:
+                    logger.warning("AI 回复生成失败: %s", e)
                     reply = ""
 
             if not reply:
@@ -829,16 +919,17 @@ def check_latest_chat():
 
             # 意向判断
             try:
-                resp2 = requests.post("https://api.deepseek.com/chat/completions",
-                    headers={"Authorization": f"Bearer {os.environ.get('DEEPSEEK_API_KEY', '')}","Content-Type": "application/json"},
-                    json={"model": "deepseek-chat",
-                        "messages": [
-                            {"role": "system", "content": "你是貸款意向量表。判斷對方意願1-5級：L1=完全無關(廣告/詐騙/無關話題)，L2=普通聊天/打招呼，L3=對貸款有興趣(詢問方案/利率/條件)，L4=很想貸款(已提供部分資料)，L5=馬上要辦(已提供完整資料/催促撥款)。只回數字如3。"},
-                            {"role": "user", "content": last_msg}
-                        ], "max_tokens": 5}, timeout=15)
-                intent = int(resp2.json()["choices"][0]["message"]["content"].strip())
-            except:
+                intent_str = deepseek_chat([
+                    {"role": "system", "content": "你是貸款意向量表。判斷對方意願1-5級：L1=完全無關(廣告/詐騙/無關話題)，L2=普通聊天/打招呼，L3=對貸款有興趣(詢問方案/利率/條件)，L4=很想貸款(已提供部分資料)，L5=馬上要辦(已提供完整資料/催促撥款)。只回數字如3。"},
+                    {"role": "user", "content": last_msg}
+                ], max_tokens=5, timeout=15)
+                intent = int(intent_str)
+            except Exception as e:
+                logger.warning("意向判断失败: %s", e)
                 intent = 1
+            # 记录 AI 回复到 SQLite
+            record_reply(device_addr, chat_name, last_msg[:100], reply[:100],
+                        intent_level=f"L{intent}")
             if intent >= 1:
                 # 聊天列表已抓到chat_name，查映射表得LINE ID
                 line_id_found = chat_name
@@ -901,6 +992,9 @@ def check_latest_chat():
     finally:
         dt_ms = (time.time() - t_start) * 1000
         device_log(device_addr, "check_chat", duration_ms=dt_ms, replied=replied_count)
+        record_task(device_addr, device_addr, "check_chat",
+                    status="ok" if replied_count > 0 else "skipped",
+                    replied_count=replied_count, duration_ms=dt_ms)
         lock.release()
     return jsonify({"ok": True, "replied": replied_count > 0, "count": replied_count, "results": results})
 
@@ -1030,6 +1124,28 @@ def check_inbox():
 
 
 # ═══════════════════════════════════════════
+# 统计查询（SQLite 持久化数据）
+# ═══════════════════════════════════════════
+
+@app.route("/stats", methods=["GET"])
+def stats():
+    """查询任务统计
+    ?device=cloud-03  可选过滤设备
+    ?hours=24         时间范围（默认 24h）
+    """
+    device_id = request.args.get("device", "")
+    hours = int(request.args.get("hours", 24))
+    from db import get_task_stats as _get_stats, get_recent_leads, get_db_size
+    return jsonify({
+        "ok": True,
+        "hours": hours,
+        "db_size_mb": round(get_db_size() / 1024 / 1024, 2),
+        "tasks": _get_stats(device_id, hours=hours),
+        "recent_leads": get_recent_leads(hours=hours),
+    })
+
+
+# ═══════════════════════════════════════════
 # 内置自动回复巡检循环（daemon thread）
 # ═══════════════════════════════════════════
 
@@ -1087,12 +1203,20 @@ def _auto_reply_loop():
             time.sleep(30)
 
 if __name__ == "__main__":
+    # 初始化 SQLite 数据库
+    init_db()
+    logger.info("SQLite 数据库已初始化: %s", os.environ.get("DB_PATH", "/app/data/bridge.db"))
+
     # 启动时连接所有已注册设备
     for dev_id, info in DEVICES.items():
         addr = info["addr"]
         logger.info("连接设备 %s: %s ...", dev_id, addr)
         subprocess.run([ADB_CMD, "connect", addr], capture_output=True)
         time.sleep(1)
+        # 记录设备初始状态
+        connected = ensure_connected(addr)
+        record_device_status(dev_id, addr, "online" if connected else "offline",
+                            detail="startup")
 
     logger.info("设备注册表: %s", json.dumps(DEVICES, ensure_ascii=False))
 
