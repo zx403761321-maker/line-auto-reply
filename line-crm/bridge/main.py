@@ -32,14 +32,13 @@ DEVICES = {
         "label": "云手机-OPPO",
     }
 }
-# 从文件加载持久化设备
+# 从文件加载持久化设备（文件值覆盖硬编码默认值）
 if os.path.exists(DEVICES_FILE):
     try:
         with open(DEVICES_FILE) as f:
             saved = json.load(f)
             for dev_id, info in saved.items():
-                if dev_id not in DEVICES:
-                    DEVICES[dev_id] = info
+                DEVICES[dev_id] = info  # 覆盖或新增
         logger.info("从文件加载设备: %s", list(saved.keys()))
     except:
         pass
@@ -1163,12 +1162,31 @@ def _auto_reply_loop():
             if len(parts) == 2:
                 add_slots[parts[0]] = int(parts[1])
 
+    # 从环境变量读取已禁用的设备 "cloud-02,cloud-03,cloud-05"
+    def _get_disabled():
+        disabled = set()
+        d_str = os.environ.get("DISABLED_DEVICES", "")
+        if d_str:
+            for d in d_str.split(","):
+                d = d.strip()
+                if d:
+                    disabled.add(d)
+        return disabled
+
+    disabled_devices = _get_disabled()
+
     # 启动后先等 10 秒，确保 Flask 已就绪
     time.sleep(10)
-    logger.info("[loop] 自动回复巡检启动, 设备数=%d, 时段=%s", len(DEVICES), add_slots)
+    logger.info("[loop] 自动回复巡检启动, 设备数=%d, 禁用=%s, 时段=%s",
+                len(DEVICES), disabled_devices or "无", add_slots)
 
     while True:
         try:
+            # 总开关检查：AUTO_REPLY_ENABLED=false 时完全跳过
+            if os.environ.get("AUTO_REPLY_ENABLED", "true").lower() == "false":
+                time.sleep(60)
+                continue
+
             now = _dt.now()
             hour = now.hour
 
@@ -1177,8 +1195,15 @@ def _auto_reply_loop():
                 time.sleep(300)
                 continue
 
+            # 每小时刷新一次禁用列表（支持热修改 env）
+            if now.minute == 0 and now.second < 10:
+                disabled_devices = _get_disabled()
+
             devices = list(DEVICES.keys())
             for dev_id in devices:
+                # 跳过已禁用的设备
+                if dev_id in disabled_devices:
+                    continue
                 try:
                     # 加好友时段跳过该设备
                     slot = add_slots.get(dev_id)

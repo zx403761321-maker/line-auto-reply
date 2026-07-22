@@ -9,6 +9,7 @@ data/leads/
 data/targets/
 data/*.json
 data/*.txt
+data/*.db*
 !data/README.md
 
 # ─── 日志 ───
