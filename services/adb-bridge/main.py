@@ -438,7 +438,7 @@ def line_add_friend_by_id():
                                 break
                         except: pass
                     _u2_cache.pop(device_addr, None)
-                    xd3 = u2.connect(device_addr)
+                    xd3 = adb_op.get_u2(device_addr)
                     xd_xml = xd3.dump_hierarchy()
                     if "修改名字" in xd_xml:
                         m = re.search(r"(?:text|content-desc)=\"修改名字\"[^>]*bounds=\"\[(\d+),(\d+)\]\[(\d+),(\d+)\]\"", xd_xml)
@@ -542,7 +542,7 @@ def check_latest_chat():
         prev_xml = ""
         for scroll_i in range(MAX_SCROLLS):
             _u2_cache.pop(device_addr, None)
-            d = u2.connect(device_addr)
+            d = adb_op.get_u2(device_addr)
             xml = d.dump_hierarchy()
 
             # 如果在好友页，点「聊天」切回
@@ -597,7 +597,7 @@ def check_latest_chat():
             prev_xml2 = ""
             for scroll_i in range(MAX_SCROLLS):
                 _u2_cache.pop(device_addr, None)
-                d = u2.connect(device_addr)
+                d = adb_op.get_u2(device_addr)
                 xml = d.dump_hierarchy()
                 if "好友列表" in xml:
                     adb_op.adb(device_addr, "shell", "input", "tap", "68", "101")

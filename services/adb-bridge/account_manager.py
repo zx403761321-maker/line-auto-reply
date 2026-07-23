@@ -40,17 +40,30 @@ class AccountManager:
     """LINE 账号状态管理器 — 每台设备对应一个 LINE 账号"""
 
     def __init__(self, db_path: str = None):
-        if db_path:
-            global DB_PATH
-            DB_PATH = db_path
+        self._db_path = db_path or DB_PATH
+        self._conn_local = threading.local()
         self._init_table()
+
+    def _get_conn(self) -> sqlite3.Connection:
+        """获取线程本地数据库连接（WAL 模式）"""
+        if not hasattr(self._conn_local, "conn") or self._conn_local.conn is None:
+            db_dir = os.path.dirname(self._db_path)
+            if db_dir:
+                os.makedirs(db_dir, exist_ok=True)
+            conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=3000")
+            conn.row_factory = sqlite3.Row
+            self._conn_local.conn = conn
+        return self._conn_local.conn
 
     # ─── 建表 ───
 
     def _init_table(self):
         """初始化 account_status 表（幂等）+ 自动迁移旧表"""
         try:
-            conn = _get_conn()
+            conn = self._get_conn()
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS account_status (
                     device_id        TEXT PRIMARY KEY,
@@ -112,7 +125,7 @@ class AccountManager:
     def get(self, device_id: str) -> dict | None:
         """查询单个账号完整状态"""
         try:
-            conn = _get_conn()
+            conn = self._get_conn()
             row = conn.execute(
                 "SELECT * FROM account_status WHERE device_id = ?",
                 (device_id,)).fetchone()
@@ -123,7 +136,7 @@ class AccountManager:
     def list_accounts(self, status: str = None) -> list[dict]:
         """列出所有账号，可按 status 过滤"""
         try:
-            conn = _get_conn()
+            conn = self._get_conn()
             if status:
                 rows = conn.execute(
                     "SELECT * FROM account_status WHERE status = ?",
@@ -145,7 +158,7 @@ class AccountManager:
         kwargs 可覆盖任意列：daily_add_limit, max_consecutive_fails, cooldown_minutes ...
         """
         try:
-            conn = _get_conn()
+            conn = self._get_conn()
             now = time.time()
             existing = conn.execute(
                 "SELECT 1 FROM account_status WHERE device_id = ?",
@@ -197,7 +210,7 @@ class AccountManager:
         """
         try:
             self._maybe_reset_daily(device_id)
-            conn = _get_conn()
+            conn = self._get_conn()
             now = time.time()
             parts = []
             vals = []
@@ -225,7 +238,7 @@ class AccountManager:
         """记录一次任务成功：daily_success+1，累计+1，连续失败清零"""
         try:
             self._maybe_reset_daily(device_id)
-            conn = _get_conn()
+            conn = self._get_conn()
             now = time.time()
             conn.execute("""
                 UPDATE account_status
@@ -252,7 +265,7 @@ class AccountManager:
         """
         try:
             self._maybe_reset_daily(device_id)
-            conn = _get_conn()
+            conn = self._get_conn()
             now = time.time()
             conn.execute("""
                 UPDATE account_status
@@ -282,7 +295,7 @@ class AccountManager:
         """记录搜索次数"""
         try:
             self._maybe_reset_daily(device_id)
-            conn = _get_conn()
+            conn = self._get_conn()
             now = time.time()
             conn.execute(
                 "UPDATE account_status SET daily_search = daily_search + ?, "
@@ -352,7 +365,7 @@ class AccountManager:
             reply_count = result.get("reply_count", 0)
             if reply_count > 0:
                 try:
-                    conn = _get_conn()
+                    conn = self._get_conn()
                     conn.execute(
                         "UPDATE account_status SET total_reply_count = total_reply_count + ?, "
                         "updated_at = ? WHERE device_id = ?",
@@ -459,7 +472,7 @@ class AccountManager:
         """用户不存在 → today_not_found+1, risk+2（不算连续失败）"""
         self._adjust_risk(device_id, +2)
         try:
-            conn = _get_conn()
+            conn = self._get_conn()
             conn.execute(
                 "UPDATE account_status SET today_not_found = today_not_found + 1, "
                 "updated_at = ? WHERE device_id = ?",
@@ -471,7 +484,7 @@ class AccountManager:
     def _adjust_risk(self, device_id: str, delta: int):
         """调整风险分，范围 [0, 100]"""
         try:
-            conn = _get_conn()
+            conn = self._get_conn()
             conn.execute(
                 "UPDATE account_status SET risk_score = MAX(0, MIN(100, risk_score + ?)), "
                 "updated_at = ? WHERE device_id = ?",
@@ -483,7 +496,7 @@ class AccountManager:
     def _touch_task(self, device_id: str, task_type: str):
         """仅更新最近任务时间（非 add_friend 成功时用）"""
         try:
-            conn = _get_conn()
+            conn = self._get_conn()
             conn.execute(
                 "UPDATE account_status SET last_task_at = ?, last_task_type = ?, "
                 "updated_at = ? WHERE device_id = ?",
@@ -511,7 +524,7 @@ class AccountManager:
         """
         try:
             self._maybe_reset_daily(device_id)
-            conn = _get_conn()
+            conn = self._get_conn()
             row = conn.execute(
                 "SELECT status, daily_success, daily_add_limit, "
                 "cooldown_until FROM account_status WHERE device_id = ?",
@@ -548,7 +561,7 @@ class AccountManager:
         """判断能否继续搜索（检查 status + 每日搜索上限）"""
         try:
             self._maybe_reset_daily(device_id)
-            conn = _get_conn()
+            conn = self._get_conn()
             row = conn.execute(
                 "SELECT status, daily_search, daily_search_limit "
                 "FROM account_status WHERE device_id = ?",
@@ -569,7 +582,7 @@ class AccountManager:
                        minutes: int = None) -> bool:
         """进入冷却状态"""
         try:
-            conn = _get_conn()
+            conn = self._get_conn()
             now = time.time()
             row = conn.execute(
                 "SELECT cooldown_minutes FROM account_status WHERE device_id = ?",
@@ -593,7 +606,7 @@ class AccountManager:
     def exit_cooldown(self, device_id: str) -> bool:
         """退出冷却，恢复 active 并清零连续失败"""
         try:
-            conn = _get_conn()
+            conn = self._get_conn()
             now = time.time()
             conn.execute("""
                 UPDATE account_status
@@ -613,7 +626,7 @@ class AccountManager:
     def _maybe_reset_daily(self, device_id: str):
         """如果跨天了，自动重置每日计数器"""
         try:
-            conn = _get_conn()
+            conn = self._get_conn()
             row = conn.execute(
                 "SELECT daily_reset_at, updated_at FROM account_status "
                 "WHERE device_id = ?", (device_id,)).fetchone()
@@ -656,7 +669,7 @@ class AccountManager:
     def reset_daily(self, device_id: str) -> bool:
         """手动重置每日计数"""
         try:
-            conn = _get_conn()
+            conn = self._get_conn()
             conn.execute("""
                 UPDATE account_status
                 SET daily_success = 0, daily_fail = 0, daily_search = 0,

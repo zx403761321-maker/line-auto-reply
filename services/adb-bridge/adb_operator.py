@@ -499,7 +499,7 @@ class AdbOperator:
                         except Exception:
                             pass
                     self.clear_u2_cache(device_addr)
-                    xd3 = u2.connect(device_addr)
+                    xd3 = self.get_u2(device_addr)
                     xd_xml = xd3.dump_hierarchy()
                     if "修改名字" in xd_xml:
                         m = re.search(
