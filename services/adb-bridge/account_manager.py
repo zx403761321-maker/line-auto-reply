@@ -48,7 +48,7 @@ class AccountManager:
     # ─── 建表 ───
 
     def _init_table(self):
-        """初始化 account_status 表（幂等）"""
+        """初始化 account_status 表（幂等）+ 自动迁移旧表"""
         try:
             conn = _get_conn()
             conn.executescript("""
@@ -67,10 +67,14 @@ class AccountManager:
                     daily_fail       INTEGER DEFAULT 0,
                     daily_search     INTEGER DEFAULT 0,
                     daily_reset_at   TEXT DEFAULT '00:00',
+                    today_not_found  INTEGER DEFAULT 0,
 
                     -- 限额
                     daily_add_limit     INTEGER DEFAULT 10,
                     daily_search_limit  INTEGER DEFAULT 50,
+
+                    -- 风险评估 (0-100)
+                    risk_score       INTEGER DEFAULT 0,
 
                     -- 冷却机制
                     cooldown_until         REAL,
@@ -90,6 +94,15 @@ class AccountManager:
                     updated_at      REAL NOT NULL
                 );
             """)
+            # 迁移：为旧表补充新字段（幂等）
+            for col, col_def in [
+                ("today_not_found", "INTEGER DEFAULT 0"),
+                ("risk_score", "INTEGER DEFAULT 0"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE account_status ADD COLUMN {col} {col_def}")
+                except Exception:
+                    pass  # 字段已存在
             conn.commit()
         except Exception:
             pass
@@ -282,50 +295,61 @@ class AccountManager:
 
     # ─── 统一上报（ADB 结束后调用） ───
 
-    # ADB 结果 → 账号状态的映射规则
-    _ERROR_RULES = {
-        # (error_keyword, action): 匹配到 error 中该关键词时执行的动作
-        # action: "cooldown" | "login_error" | "dead" | "ignore"
-        "search_limit":   "cooldown",     # 搜索达上限 → 冷却
-        "login_error":    "login_error",   # 登录异常 → 标记 login_error
-        "device_offline": "dead",          # 设备离线 → 标记 dead
-        "auth_failed":    "login_error",   # 认证失败 → 标记 login_error
-        "banned":         "banned",        # 账号被封 → 标记 banned
-    }
+    def _tomorrow_reset_ts(self, device_id: str) -> float:
+        """计算明天 daily_reset_at 对应的时间戳"""
+        try:
+            row = self.get(device_id)
+            reset_at = (row or {}).get("daily_reset_at", "00:00") or "00:00"
+            parts = reset_at.split(":")
+            rh, rm = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+            now = time.localtime(time.time())
+            # 明天同一时刻
+            tomorrow = time.mktime((
+                now.tm_year, now.tm_mon, now.tm_mday + 1,
+                rh, rm, 0, 0, 0, now.tm_isdst))
+            return tomorrow
+        except Exception:
+            return time.time() + 86400
 
     def report(self, device_id: str, result: dict) -> bool:
         """
         ADB 操作结束后统一上报结果，自动更新账号状态。
 
-        result 标准格式:
+        result 标准格式（ADB 层返回）:
         {
             "ok": True / False,
             "task_type": "add_friend" | "check_chat" | "send_message",
             "steps": ["search", "tap_add", ...],
-            "last_step": "greeted",
-            "error": "search_limit" | "未找到该用户" | ...,
-            "search_count": 1,     # 本次执行了几次搜索
-            "reply_count": 0,      # 本次回复了几条消息
+            "last_step": "greeted" | "no_result" | "search_limit" | ...,
+            "error": "search_limit" | "未找到该用户" | "login_error" | ...,
+            "search_count": 1,
+            "reply_count": 0,
         }
 
-        自动处理:
-          - 统计搜索次数
-          - 统计回复数
-          - 成功 → record_success，失败 → record_failure（含自动冷却）
-          - 匹配 _ERROR_RULES 的特殊错误 → 更新对应状态
+        状态映射:
+          ok + add_friend     → daily_success+1, consecutive_fails 清零
+          ok + check_chat     → total_reply_count + reply_count
+          搜索已达上限        → status=search_limit, cooldown_until=明天, risk+30
+          登录失败            → status=login_error
+          用户不存在          → today_not_found+1, risk+2
+          其他失败            → daily_fail+1, consecutive_fails+1, 超阈值自动冷却
         """
         try:
+            self._maybe_reset_daily(device_id)
             task_type = result.get("task_type", "add_friend")
-            search_count = result.get("search_count", 0)
-            reply_count = result.get("reply_count", 0)
+            last_step = result.get("last_step", "")
+            error = result.get("error", "")
+            steps = result.get("steps", [])
 
-            # 1. 记录搜索次数（add_friend 的 steps 中有 "search" 就算 1 次）
+            # 1. 统计搜索次数
+            search_count = result.get("search_count", 0)
+            if not search_count and "search" in steps:
+                search_count = 1
             if search_count > 0:
                 self.record_search(device_id, search_count)
-            elif "steps" in result and "search" in result.get("steps", []):
-                self.record_search(device_id, 1)
 
-            # 2. 记录回复数
+            # 2. 统计回复数
+            reply_count = result.get("reply_count", 0)
             if reply_count > 0:
                 try:
                     conn = _get_conn()
@@ -337,27 +361,136 @@ class AccountManager:
                 except Exception:
                     pass
 
-            # 3. 成功 / 失败
+            # 3. 根据结果分派
             if result.get("ok"):
-                self.record_success(device_id, task_type)
+                # ── 成功 ──
+                if task_type == "add_friend":
+                    self.record_success(device_id, task_type)
+                    # 成功降低风险分
+                    self._adjust_risk(device_id, -5)
+                else:
+                    # check_chat / send_message 成功，仅更新最近任务时间
+                    self._touch_task(device_id, task_type)
             else:
-                error = result.get("error", "")
-                self.record_failure(device_id, error, task_type)
-
-                # 4. 特殊错误 → 更新状态
-                for keyword, action in self._ERROR_RULES.items():
-                    if keyword in str(error):
-                        if action == "cooldown":
-                            self.enter_cooldown(device_id,
-                                f"检测到{keyword}，自动冷却")
-                        elif action in ("login_error", "banned", "dead"):
-                            self.update_status(device_id, status=action,
-                                last_error=error, last_error_at=time.time())
-                        break
+                # ── 失败 ──
+                # 按严重程度分级：搜索上限 > 登录异常 > 用户不存在 > 通用失败
+                if self._is_search_limit(last_step, error):
+                    self._apply_search_limit(device_id)
+                elif self._is_login_error(last_step, error):
+                    self._apply_login_error(device_id, error)
+                elif self._is_device_offline(last_step, error):
+                    self._apply_dead(device_id, error)
+                elif self._is_banned(last_step, error):
+                    self._apply_banned(device_id, error)
+                elif self._is_no_result(last_step, error):
+                    self._apply_no_result(device_id)
+                else:
+                    # 通用失败 → 计数 + 自动冷却
+                    self.record_failure(device_id, error, task_type)
 
             return True
         except Exception:
             return False
+
+    # ─── 结果判定辅助 ───
+
+    def _is_search_limit(self, last_step: str, error: str) -> bool:
+        for kw in ["search_limit", "已达上限", "搜索次数", "过于频繁"]:
+            if kw in last_step or kw in str(error):
+                return True
+        return False
+
+    def _is_login_error(self, last_step: str, error: str) -> bool:
+        for kw in ["login_error", "login_fail", "auth_failed", "token_expired"]:
+            if kw in last_step or kw in str(error):
+                return True
+        return False
+
+    def _is_device_offline(self, last_step: str, error: str) -> bool:
+        for kw in ["device_offline", "adb_connect_fail", "offline"]:
+            if kw in last_step or kw in str(error):
+                return True
+        return False
+
+    def _is_banned(self, last_step: str, error: str) -> bool:
+        for kw in ["banned", "account_suspended", "账号被封"]:
+            if kw in last_step or kw in str(error):
+                return True
+        return False
+
+    def _is_no_result(self, last_step: str, error: str) -> bool:
+        return last_step == "no_result" or "未找到" in str(error)
+
+    # ─── 状态更新动作 ───
+
+    def _apply_search_limit(self, device_id: str):
+        """搜索次数达上限 → status=search_limit, 冷却到明天"""
+        tomorrow = self._tomorrow_reset_ts(device_id)
+        self.update_status(device_id,
+            status="search_limit",
+            cooldown_until=tomorrow,
+            cooldown_reason="搜索次数已达上限",
+            last_error="search_limit",
+            last_error_at=time.time())
+        self._adjust_risk(device_id, +30)
+
+    def _apply_login_error(self, device_id: str, error: str):
+        """登录失败 → status=login_error"""
+        self.update_status(device_id,
+            status="login_error",
+            last_error=str(error)[:500],
+            last_error_at=time.time())
+
+    def _apply_dead(self, device_id: str, error: str):
+        """设备离线 → status=dead"""
+        self.update_status(device_id,
+            status="dead",
+            last_error=str(error)[:500],
+            last_error_at=time.time())
+
+    def _apply_banned(self, device_id: str, error: str):
+        """账号被封 → status=banned"""
+        self.update_status(device_id,
+            status="banned",
+            last_error=str(error)[:500],
+            last_error_at=time.time())
+
+    def _apply_no_result(self, device_id: str):
+        """用户不存在 → today_not_found+1, risk+2（不算连续失败）"""
+        self._adjust_risk(device_id, +2)
+        try:
+            conn = _get_conn()
+            conn.execute(
+                "UPDATE account_status SET today_not_found = today_not_found + 1, "
+                "updated_at = ? WHERE device_id = ?",
+                (time.time(), device_id))
+            conn.commit()
+        except Exception:
+            pass
+
+    def _adjust_risk(self, device_id: str, delta: int):
+        """调整风险分，范围 [0, 100]"""
+        try:
+            conn = _get_conn()
+            conn.execute(
+                "UPDATE account_status SET risk_score = MAX(0, MIN(100, risk_score + ?)), "
+                "updated_at = ? WHERE device_id = ?",
+                (delta, time.time(), device_id))
+            conn.commit()
+        except Exception:
+            pass
+
+    def _touch_task(self, device_id: str, task_type: str):
+        """仅更新最近任务时间（非 add_friend 成功时用）"""
+        try:
+            conn = _get_conn()
+            conn.execute(
+                "UPDATE account_status SET last_task_at = ?, last_task_type = ?, "
+                "updated_at = ? WHERE device_id = ?",
+                (time.time(), task_type, time.time(), device_id))
+            conn.commit()
+        except Exception:
+            pass
 
     # ─── 可执行判断 ───
 
@@ -370,7 +503,10 @@ class AccountManager:
           - (False, "banned")      账号被封
           - (False, "disabled")    已禁用
           - (False, "cooldown")    冷却中
+          - (False, "search_limit") 搜索上限
           - (False, "daily_limit") 今日已达上限
+          - (False, "login_error") 登录异常
+          - (False, "dead")        设备已死
           - (False, "not_found")   账号不存在
         """
         try:
@@ -384,13 +520,21 @@ class AccountManager:
             if not row:
                 return (False, "not_found")
 
-            if row["status"] == "banned":
-                return (False, "banned")
-            if row["status"] == "disabled":
-                return (False, "disabled")
-            if row["status"] == "cooldown":
+            status = row["status"]
+
+            # 永久/硬阻断状态
+            if status in ("banned", "disabled", "dead", "login_error"):
+                return (False, status)
+
+            # 冷却中
+            if status == "cooldown":
                 if row["cooldown_until"] and row["cooldown_until"] > time.time():
                     return (False, "cooldown")
+
+            # 搜索上限 — 禁止 add_friend，但 check_chat 可放行
+            if status == "search_limit":
+                if task_type in ("add_friend", "check_inbox", "search"):
+                    return (False, "search_limit")
 
             if task_type == "add_friend":
                 if row["daily_success"] >= row["daily_add_limit"]:
@@ -401,16 +545,18 @@ class AccountManager:
             return (True, "ok")  # DB 故障时放行，不阻塞业务
 
     def can_search(self, device_id: str) -> tuple[bool, str]:
-        """判断能否继续搜索（检查每日搜索上限）"""
+        """判断能否继续搜索（检查 status + 每日搜索上限）"""
         try:
             self._maybe_reset_daily(device_id)
             conn = _get_conn()
             row = conn.execute(
-                "SELECT daily_search, daily_search_limit "
+                "SELECT status, daily_search, daily_search_limit "
                 "FROM account_status WHERE device_id = ?",
                 (device_id,)).fetchone()
             if not row:
                 return (True, "ok")
+            if row["status"] == "search_limit":
+                return (False, "search_limit")
             if row["daily_search"] >= row["daily_search_limit"]:
                 return (False, "search_limit")
             return (True, "ok")
@@ -496,6 +642,10 @@ class AccountManager:
                 conn.execute("""
                     UPDATE account_status
                     SET daily_success = 0, daily_fail = 0, daily_search = 0,
+                        today_not_found = 0,
+                        -- search_limit 状态跨天自动恢复
+                        status = CASE WHEN status = 'search_limit' THEN 'active' ELSE status END,
+                        cooldown_until = CASE WHEN status = 'search_limit' THEN NULL ELSE cooldown_until END,
                         updated_at = ?
                     WHERE device_id = ?
                 """, (time.time(), device_id))
@@ -510,6 +660,10 @@ class AccountManager:
             conn.execute("""
                 UPDATE account_status
                 SET daily_success = 0, daily_fail = 0, daily_search = 0,
+                    today_not_found = 0,
+                    -- 如果只是 search_limit 状态，跨天恢复
+                    status = CASE WHEN status = 'search_limit' THEN 'active' ELSE status END,
+                    cooldown_until = CASE WHEN status = 'search_limit' THEN NULL ELSE cooldown_until END,
                     updated_at = ?
                 WHERE device_id = ?
             """, (time.time(), device_id))
@@ -531,10 +685,12 @@ class AccountManager:
                 "addr": row["addr"],
                 "label": row["label"],
                 "status": row["status"],
+                "risk_score": row.get("risk_score", 0),
                 "daily": {
                     "success": row["daily_success"],
                     "fail": row["daily_fail"],
                     "search": row["daily_search"],
+                    "not_found": row.get("today_not_found", 0),
                     "add_limit": row["daily_add_limit"],
                     "search_limit": row["daily_search_limit"],
                 },
@@ -567,9 +723,11 @@ class AccountManager:
                     "device_id": a["device_id"],
                     "label": a["label"],
                     "status": a["status"],
+                    "risk_score": a.get("risk_score", 0),
                     "daily_success": a["daily_success"],
                     "daily_fail": a["daily_fail"],
                     "daily_search": a["daily_search"],
+                    "today_not_found": a.get("today_not_found", 0),
                     "add_limit": a["daily_add_limit"],
                     "consecutive_fails": a["consecutive_fails"],
                     "cooldown_until": a["cooldown_until"],

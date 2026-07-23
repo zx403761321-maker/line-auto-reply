@@ -104,10 +104,12 @@ class Scheduler:
         检查顺序（从重到轻）：
           1. 账号不存在 → not_found
           2. banned / disabled / dead / login_error → 对应状态名
-          3. cooldown 且未到期 → cooldown
-          4. add_friend 任务: daily_success >= daily_add_limit → daily_limit
-          5. 任何需要搜索的任务: daily_search >= daily_search_limit → search_limit
-          6. 通过 → ok
+          3. search_limit 状态 → add_friend/check_inbox 被阻，check_chat 放行
+          4. cooldown 且未到期 → cooldown
+          5. paused → paused
+          6. add_friend 任务: daily_success >= daily_add_limit → daily_limit
+          7. 任何需要搜索的任务: daily_search >= daily_search_limit → search_limit
+          8. 通过 → ok
         """
         if not account:
             return (False, "not_found")
@@ -119,7 +121,12 @@ class Scheduler:
         if status in _BLOCKED_STATUSES:
             return (False, status)
 
-        # 2. 冷却中
+        # 2. 搜索上限状态 — 禁止需要搜索的任务，但允许自动回复
+        if status == "search_limit":
+            if task_type in ("add_friend", "check_inbox", "search"):
+                return (False, "search_limit")
+
+        # 3. 冷却中
         if status == "cooldown":
             cooldown_until = account.get("cooldown_until")
             if cooldown_until and cooldown_until > time.time():
@@ -127,7 +134,7 @@ class Scheduler:
                 return (False, f"cooldown({remaining}s)")
             # 冷却已过期，允许执行（调用方应该先 exit_cooldown）
 
-        # 3. 暂停
+        # 4. 暂停
         if status == "paused":
             return (False, "paused")
 
