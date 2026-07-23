@@ -280,6 +280,85 @@ class AccountManager:
         except Exception:
             return False
 
+    # ─── 统一上报（ADB 结束后调用） ───
+
+    # ADB 结果 → 账号状态的映射规则
+    _ERROR_RULES = {
+        # (error_keyword, action): 匹配到 error 中该关键词时执行的动作
+        # action: "cooldown" | "login_error" | "dead" | "ignore"
+        "search_limit":   "cooldown",     # 搜索达上限 → 冷却
+        "login_error":    "login_error",   # 登录异常 → 标记 login_error
+        "device_offline": "dead",          # 设备离线 → 标记 dead
+        "auth_failed":    "login_error",   # 认证失败 → 标记 login_error
+        "banned":         "banned",        # 账号被封 → 标记 banned
+    }
+
+    def report(self, device_id: str, result: dict) -> bool:
+        """
+        ADB 操作结束后统一上报结果，自动更新账号状态。
+
+        result 标准格式:
+        {
+            "ok": True / False,
+            "task_type": "add_friend" | "check_chat" | "send_message",
+            "steps": ["search", "tap_add", ...],
+            "last_step": "greeted",
+            "error": "search_limit" | "未找到该用户" | ...,
+            "search_count": 1,     # 本次执行了几次搜索
+            "reply_count": 0,      # 本次回复了几条消息
+        }
+
+        自动处理:
+          - 统计搜索次数
+          - 统计回复数
+          - 成功 → record_success，失败 → record_failure（含自动冷却）
+          - 匹配 _ERROR_RULES 的特殊错误 → 更新对应状态
+        """
+        try:
+            task_type = result.get("task_type", "add_friend")
+            search_count = result.get("search_count", 0)
+            reply_count = result.get("reply_count", 0)
+
+            # 1. 记录搜索次数（add_friend 的 steps 中有 "search" 就算 1 次）
+            if search_count > 0:
+                self.record_search(device_id, search_count)
+            elif "steps" in result and "search" in result.get("steps", []):
+                self.record_search(device_id, 1)
+
+            # 2. 记录回复数
+            if reply_count > 0:
+                try:
+                    conn = _get_conn()
+                    conn.execute(
+                        "UPDATE account_status SET total_reply_count = total_reply_count + ?, "
+                        "updated_at = ? WHERE device_id = ?",
+                        (reply_count, time.time(), device_id))
+                    conn.commit()
+                except Exception:
+                    pass
+
+            # 3. 成功 / 失败
+            if result.get("ok"):
+                self.record_success(device_id, task_type)
+            else:
+                error = result.get("error", "")
+                self.record_failure(device_id, error, task_type)
+
+                # 4. 特殊错误 → 更新状态
+                for keyword, action in self._ERROR_RULES.items():
+                    if keyword in str(error):
+                        if action == "cooldown":
+                            self.enter_cooldown(device_id,
+                                f"检测到{keyword}，自动冷却")
+                        elif action in ("login_error", "banned", "dead"):
+                            self.update_status(device_id, status=action,
+                                last_error=error, last_error_at=time.time())
+                        break
+
+            return True
+        except Exception:
+            return False
+
     # ─── 可执行判断 ───
 
     def can_execute(self, device_id: str,
