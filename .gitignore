@@ -15,6 +15,10 @@ backups/
 config/accounts.yaml
 *.key
 
+# 每台服务器各自维护的本地配置
+config/devices.yaml
+config/personas.yaml
+
 # IDE
 .vscode/
 .idea/
