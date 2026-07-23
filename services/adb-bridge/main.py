@@ -1,13 +1,18 @@
 """
 ADB Bridge v2 — 多设备支持
 每台手机通过 ?device=<id> 路由，默认设备为云手机
+
+分层架构:
+  main.py (业务层) → Scheduler → AccountManager → AdbOperator → 手机
 """
 import subprocess, json, time, re, base64, logging, requests, os
 import uiautomator2 as u2
 from flask import Flask, request, jsonify
 
 from logger import device_log, device_error, system_log, timed
-from db import init_db, record_device_status, record_task, record_reply
+from account_manager import AccountManager
+from adb_operator import AdbOperator
+from scheduler import Scheduler
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [adb-bridge] %(message)s")
@@ -19,46 +24,18 @@ def handle_unexpected(error):
     logger.exception("未捕获异常: %s", error)
     return jsonify({"ok": False, "error": "internal_error", "detail": str(error)[:200]}), 500
 
-ADB_CMD = "/usr/local/bin/adb"
-ADB_TIMEOUT = 15
-LINE_PACKAGE = "jp.naver.line.android"
+# ─── 初始化各层 ───
+adb_op = AdbOperator()           # ADB 层 — 只操作手机
+am = AccountManager()            # 状态层 — 只管理数据库状态
+sch = Scheduler(am)              # 调度层 — 选择最优账号
 
-# ─── 设备注册表 ───
-DEVICES_FILE = "/app/data/devices.json"
-DEVICES = {
-    "cloud-01": {
-        "addr": "your-cloud-phone-ip:499",
-        "type": "cloud",
-        "label": "云手机-OPPO",
-    }
-}
-# 从文件加载持久化设备（文件值覆盖硬编码默认值）
-if os.path.exists(DEVICES_FILE):
-    try:
-        with open(DEVICES_FILE) as f:
-            saved = json.load(f)
-            for dev_id, info in saved.items():
-                DEVICES[dev_id] = info  # 覆盖或新增
-        logger.info("从文件加载设备: %s", list(saved.keys()))
-    except:
-        pass
-
-# ─── uiautomator2 连接缓存 ───
-_u2_cache: dict[str, object] = {}
-
-
-def get_device_addr(device_id: str = None) -> str:
-    """解析设备 ID → ADB 地址"""
-    if device_id and device_id in DEVICES:
-        return DEVICES[device_id]["addr"]
-    if device_id:
-        # 可能是直接传的 host:port
-        if ":" in device_id:
-            return device_id
-    # 默认返回第一个设备
-    first = next(iter(DEVICES.values()))
-    return first["addr"]
-
+# 兼容旧代码的快捷引用
+ADB_CMD = adb_op.ADB_CMD
+ADB_TIMEOUT = adb_op.ADB_TIMEOUT
+LINE_PACKAGE = adb_op.LINE_PACKAGE
+DEVICES_FILE = adb_op.DEVICES_FILE
+DEVICES = adb_op.DEVICES
+_u2_cache = adb_op._u2_cache
 
 import threading
 _device_locks = {}
@@ -72,226 +49,9 @@ def _resolve_device() -> str:
     device_id = request.args.get("device") or request.get_json(silent=True) and request.get_json().get("device")
     if not device_id:
         device_id = request.args.get("device")
-    return get_device_addr(device_id)
+    return adb_op.get_device_addr(device_id)
 
 
-def get_u2(device_addr: str):
-    """获取 uiautomator2 连接（带缓存）"""
-    if device_addr in _u2_cache:
-        try:
-            _u2_cache[device_addr].info  # 测试连接是否存活
-            return _u2_cache[device_addr]
-        except:
-            pass
-    _u2_cache[device_addr] = u2.connect(device_addr)
-    return _u2_cache[device_addr]
-
-
-def adb(device_addr: str, *args, timeout=None):
-    """执行 ADB 命令"""
-    cmd = [ADB_CMD, "-s", device_addr] + list(args)
-    logger.info("ADB[%s]: %s", device_addr, " ".join(cmd))
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True,
-                                timeout=timeout or ADB_TIMEOUT)
-        return {"ok": result.returncode == 0,
-                "stdout": result.stdout.strip(),
-                "stderr": result.stderr.strip()}
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "stdout": "", "stderr": "timeout"}
-    except Exception as e:
-        return {"ok": False, "stdout": "", "stderr": str(e)}
-
-
-def adb_raw(device_addr: str, *args, timeout=None):
-    """执行 ADB 命令（二进制输出）"""
-    cmd = [ADB_CMD, "-s", device_addr] + list(args)
-    logger.info("ADB_RAW[%s]: %s", device_addr, " ".join(cmd))
-    try:
-        result = subprocess.run(cmd, capture_output=True,
-                                timeout=timeout or ADB_TIMEOUT)
-        return {"ok": result.returncode == 0, "stdout_bytes": result.stdout,
-                "stderr": result.stderr.decode(errors="replace").strip()}
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "stdout_bytes": b"", "stderr": "timeout"}
-    except Exception as e:
-        return {"ok": False, "stdout_bytes": b"", "stderr": str(e)}
-
-
-def ensure_connected(device_addr: str, max_retries: int = 3) -> bool:
-    """确保 ADB 连接，指数退避重连
-    重试间隔: 2s → 4s → 8s，最多 3 次
-    """
-    r = adb(device_addr, "shell", "echo", "ok", timeout=5)
-    if r["ok"] and "ok" in r["stdout"]:
-        return True
-
-    for attempt in range(1, max_retries + 1):
-        wait_s = 2 ** attempt  # 2, 4, 8 秒指数退避
-        logger.warning("ADB 断开 [%s]，第 %d/%d 次重连 (等待 %ds)...",
-                       device_addr, attempt, max_retries, wait_s)
-        subprocess.run([ADB_CMD, "connect", device_addr], capture_output=True, timeout=10)
-        time.sleep(wait_s)
-        r = adb(device_addr, "shell", "echo", "ok", timeout=5)
-        if r["ok"] and "ok" in r["stdout"]:
-            logger.info("ADB 重连成功 [%s] (第%d次)", device_addr, attempt)
-            return True
-
-    logger.error("ADB 重连失败 [%s] (已重试%d次)", device_addr, max_retries)
-    return False
-
-
-# ─── DeepSeek API 连接池 + 指数退避重试 ───
-_deepseek_session = None
-_deepseek_lock = threading.Lock()
-
-
-def _get_deepseek_session() -> requests.Session:
-    """获取/创建 DeepSeek API 连接池 Session（复用 TCP 连接）"""
-    global _deepseek_session
-    if _deepseek_session is None:
-        with _deepseek_lock:
-            if _deepseek_session is None:
-                _deepseek_session = requests.Session()
-                adapter = requests.adapters.HTTPAdapter(
-                    pool_connections=3,
-                    pool_maxsize=10,
-                    max_retries=0,  # 我们自己控制重试
-                )
-                _deepseek_session.mount("https://", adapter)
-                logger.info("DeepSeek 连接池已初始化 (pool=3/10)")
-    return _deepseek_session
-
-
-def deepseek_chat(messages: list, max_tokens: int = 80,
-                  timeout: int = 30, max_retries: int = 3) -> str:
-    """DeepSeek API 调用，带连接池复用 + 指数退避重试
-    重试间隔: 2s → 4s → 8s，遇 429 限流同样退避
-    """
-    session = _get_deepseek_session()
-    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
-
-    last_error = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = session.post(
-                "https://api.deepseek.com/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "deepseek-chat",
-                    "messages": messages,
-                    "max_tokens": max_tokens,
-                },
-                timeout=timeout,
-            )
-            if resp.status_code == 429:
-                wait_s = 2 ** attempt
-                logger.warning("DeepSeek 限流(429)，%ds 后退避重试 (第%d/%d次)",
-                               wait_s, attempt, max_retries)
-                time.sleep(wait_s)
-                continue
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"].strip()
-            return content
-        except requests.exceptions.Timeout:
-            last_error = "timeout"
-            if attempt < max_retries:
-                wait_s = 2 ** attempt
-                logger.warning("DeepSeek 超时，%ds 后重试 (第%d/%d次)",
-                               wait_s, attempt, max_retries)
-                time.sleep(wait_s)
-        except Exception as e:
-            last_error = str(e)[:100]
-            if attempt < max_retries:
-                wait_s = 2 ** attempt
-                logger.warning("DeepSeek 调用失败: %s，%ds 后重试 (第%d/%d次)",
-                               last_error, wait_s, attempt, max_retries)
-                time.sleep(wait_s)
-
-    raise Exception(f"DeepSeek API 重试耗尽 (last_error={last_error})")
-
-
-def ui_find(device_addr: str, text_contains: str, timeout=3):
-    """UIAutomator dump → 查找包含指定文字的元素坐标"""
-    for _ in range(timeout):
-        subprocess.run(
-            [ADB_CMD, "-s", device_addr, "shell", "uiautomator", "dump", "/sdcard/ui.xml"],
-            capture_output=True, timeout=10
-        )
-        r = adb_raw(device_addr, "exec-out", "cat", "/sdcard/ui.xml")
-        if not r["ok"]:
-            time.sleep(1)
-            continue
-        xml = r["stdout_bytes"].decode("utf-8", errors="replace")
-
-        # 优先找 clickable 元素
-        m = re.search(
-            rf'text="[^"]*{re.escape(text_contains)}[^"]*"[^>]*clickable="true"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"',
-            xml
-        )
-        if m:
-            cx = (int(m.group(1)) + int(m.group(3))) // 2
-            cy = (int(m.group(2)) + int(m.group(4))) // 2
-            logger.info("UI_FIND[%s] [%s] → (%d, %d)", device_addr, text_contains, cx, cy)
-            return (cx, cy)
-
-        # 退一步：不要求 clickable
-        m = re.search(
-            rf'text="[^"]*{re.escape(text_contains)}[^"]*"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"',
-            xml
-        )
-        if m:
-            cx = (int(m.group(1)) + int(m.group(3))) // 2
-            cy = (int(m.group(2)) + int(m.group(4))) // 2
-            logger.info("UI_FIND(any)[%s] [%s] → (%d, %d)", device_addr, text_contains, cx, cy)
-            return (cx, cy)
-
-        time.sleep(1)
-    return None
-
-
-def ui_tap(device_addr: str, text: str, timeout=3):
-    """找到包含 text 的元素并点击"""
-    pos = ui_find(device_addr, text, timeout)
-    if pos:
-        adb(device_addr, "shell", "input", "tap", str(pos[0]), str(pos[1]))
-        return True
-    logger.warning("UI_TAP[%s] [%s] not found", device_addr, text)
-    return False
-
-
-def type_text(device_addr: str, text: str):
-    """通过 uiautomator2 输入文字（支持中文/emoji）
-    优先找聊天输入框，其次找任意已聚焦的 EditText"""
-    d = get_u2(device_addr)
-    # 方式1: LINE 聊天输入框
-    el = d(resourceId="jp.naver.line.android:id/chat_ui_message_edit")
-    if el.exists:
-        el.click()
-        time.sleep(0.3)
-        el.set_text(text)
-        logger.info("TYPED[%s](chat): %s", device_addr, text[:50])
-        return
-    # 方式2: 已聚焦的编辑框（搜索框等）
-    el = d(focused=True, className="android.widget.EditText")
-    if el.exists:
-        el.set_text(text)
-        logger.info("TYPED[%s](search): %s", device_addr, text[:50])
-        return
-    # 方式3: 任意 EditText
-    el = d(className="android.widget.EditText")
-    if el.exists:
-        el.click()
-        time.sleep(0.3)
-        el.set_text(text)
-        logger.info("TYPED[%s](edit): %s", device_addr, text[:50])
-        return
-    # 回退
-    d.send_keys(text)
-    logger.info("TYPED[%s](fallback): %s", device_addr, text[:50])
 
 
 # ═══════════════════════════════════════════
@@ -304,7 +64,7 @@ def list_devices():
     result = {}
     for dev_id, info in DEVICES.items():
         addr = info["addr"]
-        connected = ensure_connected(addr)
+        connected = adb_op.ensure_connected(addr)
         result[dev_id] = {
             **info,
             "connected": connected,
@@ -332,7 +92,7 @@ def register_device():
     # 尝试连接
     subprocess.run([ADB_CMD, "connect", addr], capture_output=True, timeout=5)
     time.sleep(2)
-    connected = ensure_connected(addr)
+    connected = adb_op.ensure_connected(addr)
 
     logger.info("设备注册: %s → %s (connected=%s)", dev_id, addr, connected)
     # 持久化到文件
@@ -366,8 +126,8 @@ def health():
     """健康检查 — 默认检查所有设备（并发），也可 ?device=XX 查单台"""
     device_id = request.args.get("device")
     if device_id:
-        addr = get_device_addr(device_id)
-        connected = ensure_connected(addr)
+        addr = adb_op.get_device_addr(device_id)
+        connected = adb_op.ensure_connected(addr)
         code = 200 if connected else 503
         return jsonify({"ok": connected, "status": "live" if connected else "device-unreachable", "device": addr}), code
 
@@ -376,7 +136,7 @@ def health():
     results = {}
     def _check_one(dev_id, addr):
         try:
-            r = adb(addr, "shell", "echo", "ok", timeout=3)
+            r = adb_op.adb(addr, "shell", "echo", "ok", timeout=3)
             return dev_id, r["ok"] and "ok" in r["stdout"]
         except:
             return dev_id, False
@@ -396,12 +156,12 @@ def health():
 
     healthy = sum(1 for d in results.values() if d["connected"])
     all_ok = healthy == len(DEVICES)
-    # 记录每台设备状态到 SQLite
+    # 记录每台设备状态
     for dev_id, info in DEVICES.items():
         r = results.get(dev_id, {})
-        record_device_status(dev_id, info["addr"],
-                            "online" if r.get("connected") else "offline",
-                            detail="health_check")
+        am.ensure_account(dev_id, info["addr"], info.get("label", ""))
+        am.update_status(dev_id,
+                         status="online" if r.get("connected") else "offline")
     return jsonify({
         "ok": all_ok,
         "status": "live" if all_ok else "degraded",
@@ -414,11 +174,11 @@ def health():
 @app.route("/device/info", methods=["GET"])
 def device_info():
     device_addr = _resolve_device()
-    if not ensure_connected(device_addr):
+    if not adb_op.ensure_connected(device_addr):
         return jsonify({"error": "设备不可达"}), 503
-    model = adb(device_addr, "shell", "getprop", "ro.product.model")
-    android = adb(device_addr, "shell", "getprop", "ro.build.version.release")
-    battery = adb(device_addr, "shell", "dumpsys", "battery")
+    model = adb_op.adb(device_addr, "shell", "getprop", "ro.product.model")
+    android = adb_op.adb(device_addr, "shell", "getprop", "ro.build.version.release")
+    battery = adb_op.adb(device_addr, "shell", "dumpsys", "battery")
     level = "?"
     for line in battery["stdout"].split("\n"):
         if "level:" in line:
@@ -438,8 +198,8 @@ def device_info():
 @app.route("/line/open", methods=["POST"])
 def line_open():
     device_addr = _resolve_device()
-    ensure_connected(device_addr)
-    r = adb(device_addr, "shell", "monkey", "-p", LINE_PACKAGE,
+    adb_op.ensure_connected(device_addr)
+    r = adb_op.adb(device_addr, "shell", "monkey", "-p", LINE_PACKAGE,
             "-c", "android.intent.category.LAUNCHER", "1")
     time.sleep(2)
     return jsonify(r)
@@ -448,16 +208,16 @@ def line_open():
 @app.route("/line/close", methods=["POST"])
 def line_close():
     device_addr = _resolve_device()
-    ensure_connected(device_addr)
-    r = adb(device_addr, "shell", "am", "force-stop", LINE_PACKAGE)
+    adb_op.ensure_connected(device_addr)
+    r = adb_op.adb(device_addr, "shell", "am", "force-stop", LINE_PACKAGE)
     return jsonify(r)
 
 
 @app.route("/line/screenshot", methods=["GET"])
 def line_screenshot():
     device_addr = _resolve_device()
-    ensure_connected(device_addr)
-    r = adb_raw(device_addr, "exec-out", "screencap", "-p")
+    adb_op.ensure_connected(device_addr)
+    r = adb_op.adb_raw(device_addr, "exec-out", "screencap", "-p")
     if r["ok"]:
         img_b64 = base64.b64encode(r["stdout_bytes"]).decode("ascii")
         return jsonify({"ok": True, "image_base64": img_b64})
@@ -468,8 +228,8 @@ def line_screenshot():
 def line_tap():
     device_addr = _resolve_device()
     data = request.get_json()
-    ensure_connected(device_addr)
-    r = adb(device_addr, "shell", "input", "tap", str(data["x"]), str(data["y"]))
+    adb_op.ensure_connected(device_addr)
+    r = adb_op.adb(device_addr, "shell", "input", "tap", str(data["x"]), str(data["y"]))
     return jsonify(r)
 
 
@@ -477,8 +237,8 @@ def line_tap():
 def line_swipe():
     device_addr = _resolve_device()
     data = request.get_json()
-    ensure_connected(device_addr)
-    r = adb(device_addr, "shell", "input", "swipe",
+    adb_op.ensure_connected(device_addr)
+    r = adb_op.adb(device_addr, "shell", "input", "swipe",
             str(data["x1"]), str(data["y1"]),
             str(data["x2"]), str(data["y2"]))
     return jsonify(r)
@@ -488,8 +248,8 @@ def line_swipe():
 def line_type():
     device_addr = _resolve_device()
     data = request.get_json()
-    ensure_connected(device_addr)
-    type_text(device_addr, data["text"])
+    adb_op.ensure_connected(device_addr)
+    adb_op.type_text(device_addr, data["text"])
     return jsonify({"ok": True})
 
 
@@ -497,8 +257,8 @@ def line_type():
 def line_send_key():
     device_addr = _resolve_device()
     data = request.get_json()
-    ensure_connected(device_addr)
-    r = adb(device_addr, "shell", "input", "keyevent", str(data["key"]))
+    adb_op.ensure_connected(device_addr)
+    r = adb_op.adb(device_addr, "shell", "input", "keyevent", str(data["key"]))
     return jsonify(r)
 
 
@@ -520,87 +280,87 @@ def line_add_friend_by_id():
     if not lock.acquire(blocking=False):
         return jsonify({"ok": False, "error": "device_busy"})
     try:
-        ensure_connected(device_addr)
+        adb_op.ensure_connected(device_addr)
         steps = []
 
         # 1. 强制重启 LINE → u2找主页Tab精准点击
-        adb(device_addr, "shell", "am", "force-stop", LINE_PACKAGE)
+        adb_op.adb(device_addr, "shell", "am", "force-stop", LINE_PACKAGE)
         time.sleep(2)
-        adb(device_addr, "shell", "monkey", "-p", LINE_PACKAGE,
+        adb_op.adb(device_addr, "shell", "monkey", "-p", LINE_PACKAGE,
             "-c", "android.intent.category.LAUNCHER", "1")
         time.sleep(6)
-        u2home = get_u2(device_addr)
+        u2home = adb_op.get_u2(device_addr)
         home_el = u2home(text="主页")
         if home_el.exists(timeout=2):
             b = home_el.info['bounds']
-            adb(device_addr, "shell", "input", "tap", str((b['left']+b['right'])//2), str((b['top']+b['bottom'])//2))
+            adb_op.adb(device_addr, "shell", "input", "tap", str((b['left']+b['right'])//2), str((b['top']+b['bottom'])//2))
         else:
-            adb(device_addr, "shell", "input", "tap", "72", "1128")
+            adb_op.adb(device_addr, "shell", "input", "tap", "72", "1128")
         time.sleep(4)
         steps.append("goto_home")
 
         # 2. 首頁右上角➕ @(588,102)
-        adb(device_addr, "shell", "input", "tap", "588", "102")
+        adb_op.adb(device_addr, "shell", "input", "tap", "588", "102")
         time.sleep(4)
         steps.append("tap_add_friend_btn")
 
         # 2b. 验证到了添加好友页（有「搜索」才算对）
-        u2check = get_u2(device_addr)
+        u2check = adb_op.get_u2(device_addr)
         if not u2check(description="搜索").exists(timeout=3) and not u2check(text="搜索").exists(timeout=2):
             logger.info("点➕后页面不对，重启")
             steps.append("bad_page")
-            adb(device_addr, "shell", "am", "force-stop", LINE_PACKAGE)
+            adb_op.adb(device_addr, "shell", "am", "force-stop", LINE_PACKAGE)
             time.sleep(2)
-            adb(device_addr, "shell", "monkey", "-p", LINE_PACKAGE, "-c", "android.intent.category.LAUNCHER", "1")
+            adb_op.adb(device_addr, "shell", "monkey", "-p", LINE_PACKAGE, "-c", "android.intent.category.LAUNCHER", "1")
             time.sleep(5)
-            adb(device_addr, "shell", "input", "tap", "72", "1128"); time.sleep(2)
-            u2r = get_u2(device_addr)
+            adb_op.adb(device_addr, "shell", "input", "tap", "72", "1128"); time.sleep(2)
+            u2r = adb_op.get_u2(device_addr)
             ab = u2r(description="添加好友")
             if ab.exists(timeout=2): ab.click()
-            else: adb(device_addr, "shell", "input", "tap", "588", "102")
+            else: adb_op.adb(device_addr, "shell", "input", "tap", "588", "102")
             time.sleep(3)
             steps.append("retry_plus")
 
         # 3. 放大镜搜索 @(600,271)
-        adb(device_addr, "shell", "input", "tap", "600", "271")
+        adb_op.adb(device_addr, "shell", "input", "tap", "600", "271")
         time.sleep(3)
         steps.append("tap_search_icon")
 
         # 4. 验证页面：必须看到「ID」标签才继续，否则重启重来
-        xd3 = get_u2(device_addr)
+        xd3 = adb_op.get_u2(device_addr)
         if not xd3(text="ID").exists(timeout=2):
             logger.info("找不到ID标签，页面错误，重启重试")
             steps.append("page_error")
-            adb(device_addr, "shell", "am", "force-stop", LINE_PACKAGE)
+            adb_op.adb(device_addr, "shell", "am", "force-stop", LINE_PACKAGE)
             time.sleep(2)
-            adb(device_addr, "shell", "monkey", "-p", LINE_PACKAGE, "-c", "android.intent.category.LAUNCHER", "1")
+            adb_op.adb(device_addr, "shell", "monkey", "-p", LINE_PACKAGE, "-c", "android.intent.category.LAUNCHER", "1")
             time.sleep(5)
-            adb(device_addr, "shell", "input", "tap", "72", "1128"); time.sleep(2)
-            adb(device_addr, "shell", "input", "tap", "588", "102"); time.sleep(3)
-            adb(device_addr, "shell", "input", "tap", "600", "271"); time.sleep(3)
+            adb_op.adb(device_addr, "shell", "input", "tap", "72", "1128"); time.sleep(2)
+            adb_op.adb(device_addr, "shell", "input", "tap", "588", "102"); time.sleep(3)
+            adb_op.adb(device_addr, "shell", "input", "tap", "600", "271"); time.sleep(3)
             steps.append("retry_nav")
         # 切ID，输ID
-        adb(device_addr, "shell", "input", "tap", "78", "248")
+        adb_op.adb(device_addr, "shell", "input", "tap", "78", "248")
         time.sleep(0.5)
         steps.append("tab_id")
 
         # 5. 清空输入框 @(336,356) 并输入 LINE ID
-        adb(device_addr, "shell", "input", "tap", "336", "356")
+        adb_op.adb(device_addr, "shell", "input", "tap", "336", "356")
         time.sleep(0.3)
         for _ in range(5):
-            adb(device_addr, "shell", "input", "keyevent", "KEYCODE_DEL")
+            adb_op.adb(device_addr, "shell", "input", "keyevent", "KEYCODE_DEL")
             time.sleep(0.05)
-        type_text(device_addr, line_id)
+        adb_op.type_text(device_addr, line_id)
         time.sleep(0.5)
         steps.append("type_id")
 
         # 6. 点「搜索」按钮 @(650,356)
-        adb(device_addr, "shell", "input", "tap", "650", "356")
+        adb_op.adb(device_addr, "shell", "input", "tap", "650", "356")
         time.sleep(3)
         steps.append("search")
 
         # 7. 检查结果（用 u2 不用 adb dump）
-        xd = get_u2(device_addr)
+        xd = adb_op.get_u2(device_addr)
         xd_xml = xd.dump_hierarchy()
         if "未找到" in xd_xml:
             steps.append("no_result")
@@ -614,8 +374,8 @@ def line_add_friend_by_id():
                                 "error": "search_limit",
                                 "detail": f"搜索次数已达上限（匹配关键词: {kw}）"})
         # 点击「添加」
-        if not ui_tap(device_addr, "添加", timeout=2):
-            adb(device_addr, "shell", "input", "tap", "360", "834")
+        if not adb_op.ui_tap(device_addr, "添加", timeout=2):
+            adb_op.adb(device_addr, "shell", "input", "tap", "360", "834")
             time.sleep(1)
             steps.append("tap_add_xy")
         else:
@@ -623,7 +383,7 @@ def line_add_friend_by_id():
         time.sleep(1.5)
 
         # 8. 二次确认
-        ui_tap(device_addr, "添加", timeout=1)
+        adb_op.ui_tap(device_addr, "添加", timeout=1)
         time.sleep(0.5)
         steps.append("confirm_add")
 
@@ -639,7 +399,7 @@ def line_add_friend_by_id():
 
         # 9. 「添加」按钮已变成「聊天」→ 点进去发招呼
         time.sleep(2)
-        d = get_u2(device_addr)
+        d = adb_op.get_u2(device_addr)
         # 同时用 text 和 description 找「聊天」按钮
         chat_btn = d(text="聊天")
         if not chat_btn.exists(timeout=1):
@@ -654,7 +414,7 @@ def line_add_friend_by_id():
             if inp.exists(timeout=2):
                 inp.click()
                 time.sleep(0.3)
-                type_text(device_addr, message)
+                adb_op.type_text(device_addr, message)
                 time.sleep(0.5)
                 send_btn = d(description="发送")
                 if send_btn.exists(timeout=3):
@@ -673,7 +433,7 @@ def line_add_friend_by_id():
                             cy = (b.get("top",0)+b.get("bottom",0))//2
                             if cy < 150 and w > 200:
                                 nx = b["left"] + int(w * 0.7)
-                                adb(device_addr, "shell", "input", "tap", str(nx), str(cy))
+                                adb_op.adb(device_addr, "shell", "input", "tap", str(nx), str(cy))
                                 time.sleep(2)
                                 break
                         except: pass
@@ -685,11 +445,11 @@ def line_add_friend_by_id():
                         if m:
                             cx = (int(m.group(1)) + int(m.group(3))) // 2
                             cy = (int(m.group(2)) + int(m.group(4))) // 2
-                            adb(device_addr, "shell", "input", "tap", str(cx), str(cy))
+                            adb_op.adb(device_addr, "shell", "input", "tap", str(cx), str(cy))
                             time.sleep(1)
-                            type_text(device_addr, line_id)
+                            adb_op.type_text(device_addr, line_id)
                             time.sleep(0.5)
-                            adb(device_addr, "shell", "input", "tap", "360", "1122")
+                            adb_op.adb(device_addr, "shell", "input", "tap", "360", "1122")
                             time.sleep(1)
                             renamed_ok = True
                             steps.append("renamed")
@@ -710,10 +470,16 @@ def line_add_friend_by_id():
         last_step = steps[-1] if steps else "none"
         device_log(device_addr, "add_friend", duration_ms=dt_ms,
                    line_id=line_id[:20], steps=len(steps), last_step=last_step)
-        record_task(device_addr, device_addr, "add_friend",
-                    status="ok" if last_step in ("greeted", "renamed") else "failed",
-                    line_id=line_id, steps=len(steps), last_step=last_step,
-                    duration_ms=dt_ms)
+        # 通过 AccountManager 上报结果
+        am.report(device_addr, {
+            "ok": last_step in ("greeted", "renamed"),
+            "task_type": "add_friend",
+            "steps": steps,
+            "last_step": last_step,
+            "line_id": line_id,
+            "search_count": 1,
+            "duration_ms": dt_ms,
+        })
         lock.release()
     return jsonify({"ok": True, "steps": steps, "line_id": line_id, "device": device_addr})
 
@@ -728,25 +494,25 @@ def check_latest_chat():
         return jsonify({"ok": True, "replied": False, "reason": "device_busy"})
     replied_count = 0
     try:
-        ensure_connected(device_addr)
+        adb_op.ensure_connected(device_addr)
 
         # 1. 重启LINE → 关弹窗
-        adb(device_addr, "shell", "am", "force-stop", LINE_PACKAGE)
+        adb_op.adb(device_addr, "shell", "am", "force-stop", LINE_PACKAGE)
         time.sleep(1)
-        adb(device_addr, "shell", "monkey", "-p", LINE_PACKAGE,
+        adb_op.adb(device_addr, "shell", "monkey", "-p", LINE_PACKAGE,
             "-c", "android.intent.category.LAUNCHER", "1")
         time.sleep(4)
         # 关掉可能的「未读消息」弹窗
-        d_pop = get_u2(device_addr)
+        d_pop = adb_op.get_u2(device_addr)
         if d_pop(text="未读消息").exists(timeout=1) or d_pop(text="接收时间").exists(timeout=1):
-            adb(device_addr, "shell", "input", "keyevent", "KEYCODE_BACK")
+            adb_op.adb(device_addr, "shell", "input", "keyevent", "KEYCODE_BACK")
             time.sleep(1)
 
         # 2. 看底部聊天Tab有无红数字
         import re
         if device_addr in _u2_cache:
             del _u2_cache[device_addr]
-        d = get_u2(device_addr)
+        d = adb_op.get_u2(device_addr)
         xml = d.dump_hierarchy()
         has_unread = False
         # 底部(y>1050)有纯数字=红badge
@@ -767,7 +533,7 @@ def check_latest_chat():
             return jsonify({"ok": True, "replied": False, "reason": "no_unread"})
 
         # 3. 点底部聊天Tab死坐标
-        adb(device_addr, "shell", "input", "tap", "216", "1151")
+        adb_op.adb(device_addr, "shell", "input", "tap", "216", "1151")
         time.sleep(5)
 
         # ─── 自动滚屏扫描绿数字：逐屏上滑直到找到未读或滚到顶 ───
@@ -781,7 +547,7 @@ def check_latest_chat():
 
             # 如果在好友页，点「聊天」切回
             if "好友列表" in xml:
-                adb(device_addr, "shell", "input", "tap", "68", "101")
+                adb_op.adb(device_addr, "shell", "input", "tap", "68", "101")
                 time.sleep(2)
                 continue
 
@@ -804,7 +570,7 @@ def check_latest_chat():
             prev_xml = xml
 
             logger.info("第%d屏无绿数字，继续上滑...", scroll_i + 1)
-            adb(device_addr, "shell", "input", "swipe", "360", "1000", "360", "300", "600")
+            adb_op.adb(device_addr, "shell", "input", "swipe", "360", "1000", "360", "300", "600")
             time.sleep(1.0)
 
         # 去重排序
@@ -820,12 +586,12 @@ def check_latest_chat():
         if not badges:
             # 可能是页面加载慢了或进了好友页，重试一次
             logger.info("无绿数字，重试...")
-            adb(device_addr, "shell", "am", "force-stop", LINE_PACKAGE)
+            adb_op.adb(device_addr, "shell", "am", "force-stop", LINE_PACKAGE)
             time.sleep(1)
-            adb(device_addr, "shell", "monkey", "-p", LINE_PACKAGE,
+            adb_op.adb(device_addr, "shell", "monkey", "-p", LINE_PACKAGE,
                 "-c", "android.intent.category.LAUNCHER", "1")
             time.sleep(5)
-            adb(device_addr, "shell", "input", "tap", "216", "1151")
+            adb_op.adb(device_addr, "shell", "input", "tap", "216", "1151")
             time.sleep(5)
             # 重试时也多滚几屏
             prev_xml2 = ""
@@ -834,7 +600,7 @@ def check_latest_chat():
                 d = u2.connect(device_addr)
                 xml = d.dump_hierarchy()
                 if "好友列表" in xml:
-                    adb(device_addr, "shell", "input", "tap", "68", "101")
+                    adb_op.adb(device_addr, "shell", "input", "tap", "68", "101")
                     time.sleep(2)
                     continue
                 for m in re.finditer(r'text=\"(\d+)\".*?bounds=\"\[(\d+),(\d+)\]\[(\d+),(\d+)\]\"', xml):
@@ -848,7 +614,7 @@ def check_latest_chat():
                 if xml == prev_xml2 and scroll_i > 0:
                     break
                 prev_xml2 = xml
-                adb(device_addr, "shell", "input", "swipe", "360", "1000", "360", "300", "600")
+                adb_op.adb(device_addr, "shell", "input", "swipe", "360", "1000", "360", "300", "600")
                 time.sleep(1.0)
             # 去重
             seen2 = set()
@@ -878,11 +644,11 @@ def check_latest_chat():
                 ccy = (y1+y2)//2; ccx = (x1+x2)//2
                 if abs(ccy-badge_cy)<70 and ccx<350 and len(txt)>1 and not txt.isdigit():
                     chat_name = txt.strip(); break
-            adb(device_addr, "shell", "input", "tap", "360", str(badge_cy))
+            adb_op.adb(device_addr, "shell", "input", "tap", "360", str(badge_cy))
             time.sleep(2)
 
             # 读消息：兼容不同 LINE 版本，同时查 content-desc 和 text
-            d2 = get_u2(device_addr)
+            d2 = adb_op.get_u2(device_addr)
             xml_chat = d2.dump_hierarchy()
             last_msg = ""
             # 对方消息特征：左侧气泡（x<屏幕宽度的40%，动态适配）
@@ -900,7 +666,7 @@ def check_latest_chat():
 
             if not last_msg:
                 logger.info("跳过: chat_name=%s 无对方消息 (xml片段=%s)", chat_name[:20], xml_chat[-200:])
-                adb(device_addr, "shell", "input", "keyevent", "KEYCODE_BACK")
+                adb_op.adb(device_addr, "shell", "input", "keyevent", "KEYCODE_BACK")
                 time.sleep(1)
                 continue  # 跳过这条，处理下一个
 
@@ -910,7 +676,7 @@ def check_latest_chat():
                 reply = "你好"
             else:
                 try:
-                    reply = deepseek_chat([
+                    reply = adb_op.deepseek_chat([
                         {"role": "system", "content": "你是環球貸款小助理。用繁體中文回覆2-3句話，語氣親切像朋友聊天。\n\n公司資訊：\n- 申請網址：https://dorrj.com\n- 官方LINE：@583gyplg\n- 首貸最高50000元\n- 全程線上審批30-60分鐘，通過即撥款，不照會\n\n標準方案（8~10天）：\n- 借10000實撥7000\n- 借20000實撥14000\n- 借30000實撥21000\n\n官方LINE審核方案（7天）：\n- 借5000實撥3000 / 借7000實撥4000 / 借10000實撥6000\n- 到期日18:00前還款，遲繳10%罰款，逾期每日15%\n\n客戶有意申請時，引導提供：姓名、電話、身份證字號、居住地址、公司名稱、公司電話、在職時間、每月收入、薪轉勞保、申請金額、資金用途。引導客戶點擊網址 https://dorrj.com 申請，或添加官方LINE @583gyplg。\n\n注意事項：\n- 還款僅轉帳與超商代碼繳費\n- 不主動降價、不承諾一定通過、不提前收費\n- 不要發送身份驗證流程（身分證/自拍影片）除非對方已提交基本資料"},
                         {"role": "user", "content": last_msg}
                     ], max_tokens=80, timeout=30)
@@ -919,13 +685,13 @@ def check_latest_chat():
                     reply = ""
 
             if not reply:
-                adb(device_addr, "shell", "input", "keyevent", "KEYCODE_BACK")
+                adb_op.adb(device_addr, "shell", "input", "keyevent", "KEYCODE_BACK")
                 time.sleep(1)
                 continue
 
             # 意向判断
             try:
-                intent_str = deepseek_chat([
+                intent_str = adb_op.deepseek_chat([
                     {"role": "system", "content": "你是貸款意向量表。判斷對方意願1-5級：L1=完全無關(廣告/詐騙/無關話題)，L2=普通聊天/打招呼，L3=對貸款有興趣(詢問方案/利率/條件)，L4=很想貸款(已提供部分資料)，L5=馬上要辦(已提供完整資料/催促撥款)。只回數字如3。"},
                     {"role": "user", "content": last_msg}
                 ], max_tokens=5, timeout=15)
@@ -933,9 +699,8 @@ def check_latest_chat():
             except Exception as e:
                 logger.warning("意向判断失败: %s", e)
                 intent = 1
-            # 记录 AI 回复到 SQLite
-            record_reply(device_addr, chat_name, last_msg[:100], reply[:100],
-                        intent_level=f"L{intent}")
+            # 记录最近任务时间
+            am._touch_task(device_addr, "check_chat")
             if intent >= 1:
                 # 聊天列表已抓到chat_name，查映射表得LINE ID
                 line_id_found = chat_name
@@ -971,12 +736,12 @@ def check_latest_chat():
             logger.info("[%d] %s → %s", replied_count, last_msg[:20], reply[:20])
 
             # 回聊天列表
-            adb(device_addr, "shell", "input", "keyevent", "KEYCODE_BACK")
+            adb_op.adb(device_addr, "shell", "input", "keyevent", "KEYCODE_BACK")
             time.sleep(1)
 
             # 重扫剩余绿数字（也要滚屏查找）
             for scroll_i in range(MAX_SCROLLS):
-                d3 = get_u2(device_addr)
+                d3 = adb_op.get_u2(device_addr)
                 xml2 = d3.dump_hierarchy()
                 badges = []
                 for m in re.finditer(r'text=\"(\d+)\".*?bounds=\"\[(\d+),(\d+)\]\[(\d+),(\d+)\]\"', xml2):
@@ -988,19 +753,24 @@ def check_latest_chat():
                 if badges:
                     break
                 # 没找到就继续上滑
-                adb(device_addr, "shell", "input", "swipe", "360", "1000", "360", "300", "600")
+                adb_op.adb(device_addr, "shell", "input", "swipe", "360", "1000", "360", "300", "600")
                 time.sleep(0.8)
 
         # 全部回完，回聊天列表方便下次巡逻
-        adb(device_addr, "shell", "input", "keyevent", "KEYCODE_BACK")
+        adb_op.adb(device_addr, "shell", "input", "keyevent", "KEYCODE_BACK")
         time.sleep(1)
 
     finally:
         dt_ms = (time.time() - t_start) * 1000
         device_log(device_addr, "check_chat", duration_ms=dt_ms, replied=replied_count)
-        record_task(device_addr, device_addr, "check_chat",
-                    status="ok" if replied_count > 0 else "skipped",
-                    replied_count=replied_count, duration_ms=dt_ms)
+        am.report(device_addr, {
+            "ok": replied_count > 0,
+            "task_type": "check_chat",
+            "steps": [],
+            "last_step": "replied" if replied_count > 0 else "no_unread",
+            "reply_count": replied_count,
+            "duration_ms": dt_ms,
+        })
         lock.release()
     return jsonify({"ok": True, "replied": replied_count > 0, "count": replied_count, "results": results})
 
@@ -1013,27 +783,27 @@ def line_send_message():
     text = data["text"]
     device_addr = _resolve_device()
 
-    ensure_connected(device_addr)
+    adb_op.ensure_connected(device_addr)
 
-    adb(device_addr, "shell", "monkey", "-p", LINE_PACKAGE,
+    adb_op.adb(device_addr, "shell", "monkey", "-p", LINE_PACKAGE,
         "-c", "android.intent.category.LAUNCHER", "1")
     time.sleep(2)
 
     if chat_name:
-        adb(device_addr, "shell", "input", "tap", "650", "80")
+        adb_op.adb(device_addr, "shell", "input", "tap", "650", "80")
         time.sleep(1)
-        adb(device_addr, "shell", "input", "text", chat_name.replace(" ", "%s"))
+        adb_op.adb(device_addr, "shell", "input", "text", chat_name.replace(" ", "%s"))
         time.sleep(1)
-        adb(device_addr, "shell", "input", "keyevent", "KEYCODE_ENTER")
+        adb_op.adb(device_addr, "shell", "input", "keyevent", "KEYCODE_ENTER")
         time.sleep(2)
-        adb(device_addr, "shell", "input", "tap", "360", "280")
+        adb_op.adb(device_addr, "shell", "input", "tap", "360", "280")
         time.sleep(1.5)
 
-    adb(device_addr, "shell", "input", "tap", "360", "1200")
+    adb_op.adb(device_addr, "shell", "input", "tap", "360", "1200")
     time.sleep(0.5)
-    adb(device_addr, "shell", "input", "text", text.replace(" ", "%s"))
+    adb_op.adb(device_addr, "shell", "input", "text", text.replace(" ", "%s"))
     time.sleep(0.5)
-    adb(device_addr, "shell", "input", "keyevent", "KEYCODE_ENTER")
+    adb_op.adb(device_addr, "shell", "input", "keyevent", "KEYCODE_ENTER")
     time.sleep(0.5)
 
     return jsonify({"ok": True, "text": text, "chat_name": chat_name, "device": device_addr})
@@ -1043,21 +813,21 @@ def line_send_message():
 def check_inbox():
     """检查收件箱 — 只返回未读聊天"""
     device_addr = _resolve_device()
-    ensure_connected(device_addr)
+    adb_op.ensure_connected(device_addr)
 
     # 强制重启 LINE，确保在干净状态
-    adb(device_addr, "shell", "am", "force-stop", LINE_PACKAGE)
+    adb_op.adb(device_addr, "shell", "am", "force-stop", LINE_PACKAGE)
     time.sleep(1)
-    adb(device_addr, "shell", "monkey", "-p", LINE_PACKAGE,
+    adb_op.adb(device_addr, "shell", "monkey", "-p", LINE_PACKAGE,
         "-c", "android.intent.category.LAUNCHER", "1")
     time.sleep(4)
     # 切到聊天 Tab
-    adb(device_addr, "shell", "input", "tap", "216", "1128")
+    adb_op.adb(device_addr, "shell", "input", "tap", "216", "1128")
     time.sleep(1)
 
-    adb(device_addr, "shell", "uiautomator", "dump", "/sdcard/ui.xml")
+    adb_op.adb(device_addr, "shell", "uiautomator", "dump", "/sdcard/ui.xml")
     time.sleep(0.5)
-    r = adb_raw(device_addr, "exec-out", "cat", "/sdcard/ui.xml")
+    r = adb_op.adb_raw(device_addr, "exec-out", "cat", "/sdcard/ui.xml")
     ui_xml = r["stdout_bytes"].decode("utf-8", errors="replace") if r["ok"] else ""
 
     if not ui_xml:
@@ -1099,12 +869,12 @@ def check_inbox():
     detailed_messages = []
     for msg in messages[:5]:
         cx, cy = msg["center"]
-        adb(device_addr, "shell", "input", "tap", str(cx), str(cy))
+        adb_op.adb(device_addr, "shell", "input", "tap", str(cx), str(cy))
         time.sleep(2)
 
-        adb(device_addr, "shell", "uiautomator", "dump", "/sdcard/ui.xml")
+        adb_op.adb(device_addr, "shell", "uiautomator", "dump", "/sdcard/ui.xml")
         time.sleep(0.5)
-        r2 = adb_raw(device_addr, "exec-out", "cat", "/sdcard/ui.xml")
+        r2 = adb_op.adb_raw(device_addr, "exec-out", "cat", "/sdcard/ui.xml")
         chat_xml = r2["stdout_bytes"].decode("utf-8", errors="replace") if r2["ok"] else ""
 
         if chat_xml:
@@ -1118,7 +888,7 @@ def check_inbox():
                 "message_previews": msg_elements[-3:] if len(msg_elements) > 3 else msg_elements
             })
 
-        adb(device_addr, "shell", "input", "keyevent", "KEYCODE_BACK")
+        adb_op.adb(device_addr, "shell", "input", "keyevent", "KEYCODE_BACK")
         time.sleep(1.5)
 
     return jsonify({
@@ -1235,9 +1005,8 @@ def _auto_reply_loop():
             time.sleep(30)
 
 if __name__ == "__main__":
-    # 初始化 SQLite 数据库
-    init_db()
-    logger.info("SQLite 数据库已初始化: %s", os.environ.get("DB_PATH", "/app/data/bridge.db"))
+    # AccountManager 初始化时自动建表
+    logger.info("数据库已初始化: %s", os.environ.get("DB_PATH", "/app/data/bridge.db"))
 
     # 启动时连接所有已注册设备
     for dev_id, info in DEVICES.items():
@@ -1245,10 +1014,10 @@ if __name__ == "__main__":
         logger.info("连接设备 %s: %s ...", dev_id, addr)
         subprocess.run([ADB_CMD, "connect", addr], capture_output=True)
         time.sleep(1)
-        # 记录设备初始状态
-        connected = ensure_connected(addr)
-        record_device_status(dev_id, addr, "online" if connected else "offline",
-                            detail="startup")
+        # 同步设备到 AccountManager + 记录初始状态
+        connected = adb_op.ensure_connected(addr)
+        am.ensure_account(dev_id, addr, info.get("label", ""))
+        am.update_status(dev_id, status="online" if connected else "offline")
 
     logger.info("设备注册表: %s", json.dumps(DEVICES, ensure_ascii=False))
 
