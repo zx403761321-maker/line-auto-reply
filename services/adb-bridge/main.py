@@ -606,6 +606,13 @@ def line_add_friend_by_id():
             steps.append("no_result")
             return jsonify({"ok": False, "steps": steps, "line_id": line_id,
                             "error": "未找到该用户"})
+        # 检测搜索次数上限弹窗
+        for kw in ["已达上限", "搜索次数", "过于频繁", "稍后再试", "限制"]:
+            if kw in xd_xml:
+                steps.append("search_limit")
+                return jsonify({"ok": False, "steps": steps, "line_id": line_id,
+                                "error": "search_limit",
+                                "detail": f"搜索次数已达上限（匹配关键词: {kw}）"})
         # 点击「添加」
         if not ui_tap(device_addr, "添加", timeout=2):
             adb(device_addr, "shell", "input", "tap", "360", "834")
