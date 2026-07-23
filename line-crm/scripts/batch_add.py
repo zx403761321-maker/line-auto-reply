@@ -15,12 +15,16 @@ BRIDGE = "http://127.0.0.1:8899"
 RESULT_FILE = "/root/line-crm/data/state/batch_result.json"
 DEFAULT_DEVICE = "cloud-01"
 
-# ─── 首条问候语池 ───
+# ─── 首条问候语池（网址文案，随机轮换）───
 GREETINGS = [
-    "你好呀～我是貸款顧問美玲，朋友介紹認識的，有資金需求可以聊聊 😊",
-    "哈囉！我是貸款顧問，聽說你最近有資金需求，方便聊聊嗎？",
-    "嗨！我是貸款顧問小琳，需要資金周轉或是想了解貸款方案都可以問我喔～",
-    "你好！我是貸款這邊的，聽說你對貸款有興趣，加個LINE聊一下？",
+    "資金周轉不求人，線上快速申請 👉 https://dorrj.com",
+    "急需用錢？最快1小時撥款，點這申請 👉 https://dorrj.com",
+    "臨時缺資金？線上審核不照會，馬上申請 👉 https://dorrj.com",
+    "小額周轉無壓力，線上快速到帳 👉 https://dorrj.com",
+    "資金卡關？線上申請30分鐘審核通過 👉 https://dorrj.com",
+    "不用出門，手機就能申請借款 👉 https://dorrj.com",
+    "短期周轉救急，線上審批當天撥款 👉 https://dorrj.com",
+    "缺錢周轉？點我快速申請，免照會 👉 https://dorrj.com",
 ]
 
 

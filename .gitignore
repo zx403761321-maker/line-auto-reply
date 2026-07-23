@@ -1,24 +1,40 @@
-# 运行时数据
-data/state/
-logs/
-*.log
-
-# 临时文件
-/tmp/
-*.pyc
-__pycache__/
-
-# 备份
-backups/
-
-# 敏感配置（如果有token/key）
-config/accounts.yaml
+# ─── 密钥和敏感配置 ───
+.env
 *.key
+*_secret*
 
-# 每台服务器各自维护的本地配置
+# ─── 每台服务器各自维护的本地配置 ───
 config/devices.yaml
 config/personas.yaml
 
-# IDE
-.vscode/
+# ─── 客户数据（绝不能提交） ───
+data/state/
+data/leads/
+data/targets/
+data/*.json
+data/*.txt
+data/*.db*
+!data/README.md
+
+# ─── 日志 ───
+logs/
+*.log
+
+# ─── 运行时数据 ───
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+Thumbs.db
+
+# ─── IDE ───
 .idea/
+.vscode/
+
+# ─── 证书 ───
+caddy/certs/
+*.so
+*.so.0
+services/adb-bridge/adb
+services/adb-bridge/adb-host
+services/adb-bridge/adb-libs*

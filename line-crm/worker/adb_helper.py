@@ -17,7 +17,7 @@ def adb_command(device_addr: str, *args, timeout: int = ADB_TIMEOUT):
     执行 ADB 命令。
 
     Args:
-        device_addr: 设备地址，如 "your-cloud-phone-ip:499" 或 "emulator-5554"
+        device_addr: 设备地址，如 "39.109.41.52:499" 或 "emulator-5554"
         *args: ADB 参数，如 "shell", "input", "tap", "100", "200"
         timeout: 超时秒数
 

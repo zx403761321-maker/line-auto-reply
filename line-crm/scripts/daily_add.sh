@@ -1,9 +1,11 @@
 #!/bin/bash
+sleep $((RANDOM % 1800))
 # 每天9点：顺着名单继续，直到当天满20个成功
 TARGETS="/tmp/targets_clean.txt"
 BRIDGE="http://127.0.0.1:8899"
-DEVICE="cloud-02"
-DAILY_GOAL=20
+GREETING=$(shuf -n1 /root/line-crm/config/greetings.txt)
+DEVICE="cloud-01"
+DAILY_GOAL=25
 LOG="/root/line-crm/logs/daily_add.log"
 POSFILE="/root/line-crm/data/state/targets_position_shared"
 
@@ -30,7 +32,7 @@ for id in $all_ids; do
     echo "[$(date +%m-%d\ %H:%M)] [$DEVICE] #${idx} $id" >> $LOG
     result=$(curl -s -X POST "$BRIDGE/line/add-friend-by-id?device=$DEVICE" \
       -H "Content-Type: application/json" \
-      -d "{\"line_id\":\"$id\",\"message\":\"你好～我是貸款顧問雅琳，有資金需求都可以問我喔 😊\"}" \
+      -d "{\"line_id\":\"$id\",\"message\":\"你好～我是貸款顧問美玲，有資金需求都可以問我喔 😊\"}" \
       --max-time 90)
     ok=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok'))" 2>/dev/null)
     steps=$(echo "$result" | python3 -c "import sys,json; print(' '.join(json.load(sys.stdin).get('steps',[])[-3:]))" 2>/dev/null)
@@ -46,7 +48,7 @@ for id in $all_ids; do
     echo $idx > "$POSFILE"
 
     [ $success -ge $DAILY_GOAL ] && break
-    sleep 90
+    sleep $((180 + RANDOM % 120))
 done
 
 echo "[$(date)] 完成：成功${success}，位置${idx}" >> $LOG

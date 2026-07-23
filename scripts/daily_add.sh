@@ -1,11 +1,9 @@
 #!/bin/bash
-sleep $((RANDOM % 1800))
 # 每天9点：顺着名单继续，直到当天满20个成功
 TARGETS="/tmp/targets_clean.txt"
 BRIDGE="http://127.0.0.1:8899"
-GREETING=$(shuf -n1 /root/line-crm/config/greetings.txt)
 DEVICE="cloud-01"
-DAILY_GOAL=25
+DAILY_GOAL=20
 LOG="/root/line-crm/logs/daily_add.log"
 POSFILE="/root/line-crm/data/state/targets_position_shared"
 
@@ -48,7 +46,7 @@ for id in $all_ids; do
     echo $idx > "$POSFILE"
 
     [ $success -ge $DAILY_GOAL ] && break
-    sleep $((180 + RANDOM % 120))
+    sleep 90
 done
 
 echo "[$(date)] 完成：成功${success}，位置${idx}" >> $LOG
