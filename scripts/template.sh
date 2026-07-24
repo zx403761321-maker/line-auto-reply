@@ -1,6 +1,6 @@
 #!/bin/bash
 sleep $((RANDOM % 30))
-TARGETS="/root/targets_all.txt"
+TARGETS="/root/line-crm/data/targets/targets_all.txt"
 BRIDGE="${BRIDGE:-http://127.0.0.1:8899}"
 GREETING_FILE="/root/line-crm/config/greetings.txt"
 DEVICE="$1"

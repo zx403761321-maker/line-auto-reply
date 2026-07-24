@@ -35,13 +35,8 @@ deploy:
 	@git add scripts/ && git diff --cached --stat && echo "make commit 提交"
 
 health:
-	@echo "=== 生产桥 ===" && curl -s --max-time 5 http://127.0.0.1:8899/health | python3 -m json.tool 2>/dev/null || echo "❌"
-	@echo "=== 测试桥 ===" && curl -s --max-time 5 http://127.0.0.1:8898/health | python3 -m json.tool 2>/dev/null || echo "⏸️  未运行"
-	@echo "=== 云手机 ==="
-	@for ip in 39.109.41.52:499 39.109.41.74:499 39.109.41.244:498 39.109.43.51:499 39.109.37.123:500 39.109.42.124:500 39.109.42.197:500 39.109.42.173:500 39.109.42.47:500 39.109.42.126:500; do \
-		r=$$(adb -s $$ip shell echo ok 2>&1); \
-		[ "$$r" = "ok" ] && echo "  ✅ $$ip" || echo "  ❌ $$ip"; \
-	done
+	@echo "=== Bridge ===" && curl -s --max-time 5 http://127.0.0.1:8899/health | python3 -m json.tool 2>/dev/null || echo "❌"
+	@echo "=== 账号状态 (DB) ===" && docker exec openclaw-adb-bridge python3 -c "import sqlite3;conn=sqlite3.connect('/app/data/bridge.db');conn.row_factory=sqlite3.Row;rows=conn.execute('SELECT device_id,status,daily_success,daily_search,risk_score FROM account_status ORDER BY device_id').fetchall();[print(f\"  {'🟢' if r['status']=='online' else '🔴'} {r['device_id']:12s} success={r['daily_success']:2d} search={r['daily_search']:2d} risk={r['risk_score']}\") for r in rows]"
 
 clean:
 	@rm -f data/state/targets_position_shared
@@ -53,5 +48,5 @@ push:
 	@bash scripts/report.sh
 
 build:
-	@cd bridge && docker build -t openclaw-adb-bridge:local .
+	@docker compose build adb-bridge
 	@echo "✅ Bridge 镜像构建完成"

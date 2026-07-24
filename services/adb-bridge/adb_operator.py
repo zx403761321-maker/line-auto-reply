@@ -17,6 +17,7 @@ AdbOperator — ADB 层，只负责操作手机。
 import subprocess, json, time, re, base64, logging, requests, os
 import uiautomator2 as u2
 import threading
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ class AdbOperator:
     ADB_CMD = "/usr/local/bin/adb"
     ADB_TIMEOUT = 15
     LINE_PACKAGE = "jp.naver.line.android"
-    DEVICES_FILE = "/app/data/devices.json"
+    DEVICES_FILE = "/root/line-crm/config/devices.yaml"
 
     def __init__(self, devices: dict = None):
         """
@@ -43,18 +44,24 @@ class AdbOperator:
     # ─── 设备注册 ───
 
     def _load_devices(self) -> dict:
-        devs = {
-            "cloud-01": {"addr": "your-cloud-phone-ip:499", "type": "cloud", "label": "云手机-OPPO"}
-        }
+        """从 config/devices.yaml 加载设备列表，解析为内部格式"""
+        devs = {}
         if os.path.exists(self.DEVICES_FILE):
             try:
                 with open(self.DEVICES_FILE) as f:
-                    saved = json.load(f)
-                    for dev_id, info in saved.items():
-                        devs[dev_id] = info
-                logger.info("从文件加载设备: %s", list(saved.keys()))
-            except Exception:
-                pass
+                    config = yaml.safe_load(f)
+                for d in config.get("devices", []):
+                    if d.get("enabled", True):
+                        devs[d["id"]] = {
+                            "addr": f"{d['adb_host']}:{d['adb_port']}",
+                            "type": d.get("type", "cloud"),
+                            "label": d.get("name", d["id"]),
+                        }
+                logger.info("从 %s 加载 %d 台设备", self.DEVICES_FILE, len(devs))
+            except Exception as e:
+                logger.error("加载设备配置失败: %s", e)
+        if not devs:
+            logger.warning("无设备配置，使用空列表")
         return devs
 
     def reload_devices(self):

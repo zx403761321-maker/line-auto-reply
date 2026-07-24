@@ -44,12 +44,12 @@ def get_device_lock(addr):
         _device_locks[addr] = threading.Lock()
     return _device_locks[addr]
 
-def _resolve_device() -> str:
-    """从请求参数解析目标设备 ADB 地址"""
-    device_id = request.args.get("device") or request.get_json(silent=True) and request.get_json().get("device")
+def _resolve_device() -> tuple[str, str]:
+    """从请求参数解析目标设备，返回 (device_id, device_addr)"""
+    device_id = request.args.get("device") or (request.get_json(silent=True) or {}).get("device")
     if not device_id:
-        device_id = request.args.get("device")
-    return adb_op.get_device_addr(device_id)
+        device_id = list(DEVICES.keys())[0]  # fallback
+    return device_id, adb_op.get_device_addr(device_id)
 
 
 
@@ -173,7 +173,7 @@ def health():
 
 @app.route("/device/info", methods=["GET"])
 def device_info():
-    device_addr = _resolve_device()
+    device_id, device_addr = _resolve_device()
     if not adb_op.ensure_connected(device_addr):
         return jsonify({"error": "设备不可达"}), 503
     model = adb_op.adb(device_addr, "shell", "getprop", "ro.product.model")
@@ -197,7 +197,7 @@ def device_info():
 
 @app.route("/line/open", methods=["POST"])
 def line_open():
-    device_addr = _resolve_device()
+    device_id, device_addr = _resolve_device()
     adb_op.ensure_connected(device_addr)
     r = adb_op.adb(device_addr, "shell", "monkey", "-p", LINE_PACKAGE,
             "-c", "android.intent.category.LAUNCHER", "1")
@@ -207,7 +207,7 @@ def line_open():
 
 @app.route("/line/close", methods=["POST"])
 def line_close():
-    device_addr = _resolve_device()
+    device_id, device_addr = _resolve_device()
     adb_op.ensure_connected(device_addr)
     r = adb_op.adb(device_addr, "shell", "am", "force-stop", LINE_PACKAGE)
     return jsonify(r)
@@ -215,7 +215,7 @@ def line_close():
 
 @app.route("/line/screenshot", methods=["GET"])
 def line_screenshot():
-    device_addr = _resolve_device()
+    device_id, device_addr = _resolve_device()
     adb_op.ensure_connected(device_addr)
     r = adb_op.adb_raw(device_addr, "exec-out", "screencap", "-p")
     if r["ok"]:
@@ -226,7 +226,7 @@ def line_screenshot():
 
 @app.route("/line/tap", methods=["POST"])
 def line_tap():
-    device_addr = _resolve_device()
+    device_id, device_addr = _resolve_device()
     data = request.get_json()
     adb_op.ensure_connected(device_addr)
     r = adb_op.adb(device_addr, "shell", "input", "tap", str(data["x"]), str(data["y"]))
@@ -235,7 +235,7 @@ def line_tap():
 
 @app.route("/line/swipe", methods=["POST"])
 def line_swipe():
-    device_addr = _resolve_device()
+    device_id, device_addr = _resolve_device()
     data = request.get_json()
     adb_op.ensure_connected(device_addr)
     r = adb_op.adb(device_addr, "shell", "input", "swipe",
@@ -246,7 +246,7 @@ def line_swipe():
 
 @app.route("/line/type", methods=["POST"])
 def line_type():
-    device_addr = _resolve_device()
+    device_id, device_addr = _resolve_device()
     data = request.get_json()
     adb_op.ensure_connected(device_addr)
     adb_op.type_text(device_addr, data["text"])
@@ -255,7 +255,7 @@ def line_type():
 
 @app.route("/line/send-key", methods=["POST"])
 def line_send_key():
-    device_addr = _resolve_device()
+    device_id, device_addr = _resolve_device()
     data = request.get_json()
     adb_op.ensure_connected(device_addr)
     r = adb_op.adb(device_addr, "shell", "input", "keyevent", str(data["key"]))
@@ -274,7 +274,7 @@ def line_add_friend_by_id():
     data = request.get_json()
     line_id = data["line_id"]
     message = data.get("message", "你好，我是貸款顧問")
-    device_addr = _resolve_device()
+    device_id, device_addr = _resolve_device()
     t_start = time.time()
     lock = get_device_lock(device_addr)
     if not lock.acquire(blocking=False):
@@ -471,7 +471,7 @@ def line_add_friend_by_id():
         device_log(device_addr, "add_friend", duration_ms=dt_ms,
                    line_id=line_id[:20], steps=len(steps), last_step=last_step)
         # 通过 AccountManager 上报结果
-        am.report(device_addr, {
+        am.report(device_id, {
             "ok": last_step in ("greeted", "renamed"),
             "task_type": "add_friend",
             "steps": steps,
@@ -487,7 +487,7 @@ def line_add_friend_by_id():
 @app.route("/line/check-latest-chat", methods=["POST"])
 def check_latest_chat():
     """自动回复：找绿色未读数字 → 进聊天 → 读消息 → 回复 → 发送"""
-    device_addr = _resolve_device()
+    device_id, device_addr = _resolve_device()
     t_start = time.time()
     lock = get_device_lock(device_addr)
     if not lock.acquire(blocking=False):
@@ -700,7 +700,7 @@ def check_latest_chat():
                 logger.warning("意向判断失败: %s", e)
                 intent = 1
             # 记录最近任务时间
-            am._touch_task(device_addr, "check_chat")
+            am._touch_task(device_id, "check_chat")
             if intent >= 1:
                 # 聊天列表已抓到chat_name，查映射表得LINE ID
                 line_id_found = chat_name
@@ -763,7 +763,7 @@ def check_latest_chat():
     finally:
         dt_ms = (time.time() - t_start) * 1000
         device_log(device_addr, "check_chat", duration_ms=dt_ms, replied=replied_count)
-        am.report(device_addr, {
+        am.report(device_id, {
             "ok": replied_count > 0,
             "task_type": "check_chat",
             "steps": [],
@@ -781,7 +781,7 @@ def line_send_message():
     data = request.get_json()
     chat_name = data.get("chat_name", "")
     text = data["text"]
-    device_addr = _resolve_device()
+    device_id, device_addr = _resolve_device()
 
     adb_op.ensure_connected(device_addr)
 
@@ -812,7 +812,7 @@ def line_send_message():
 @app.route("/line/check-inbox", methods=["POST"])
 def check_inbox():
     """检查收件箱 — 只返回未读聊天"""
-    device_addr = _resolve_device()
+    device_id, device_addr = _resolve_device()
     adb_op.ensure_connected(device_addr)
 
     # 强制重启 LINE，确保在干净状态
@@ -1004,22 +1004,32 @@ def _auto_reply_loop():
             logger.exception("[loop] 循环异常: %s", e)
             time.sleep(30)
 
-if __name__ == "__main__":
-    # AccountManager 初始化时自动建表
-    logger.info("数据库已初始化: %s", os.environ.get("DB_PATH", "/app/data/bridge.db"))
-
-    # 启动时连接所有已注册设备
+def _startup_connect_devices():
+    """后台线程：启动时连接所有已注册设备并同步到 AccountManager"""
+    time.sleep(2)  # 等 Flask 先启动
     for dev_id, info in DEVICES.items():
         addr = info["addr"]
         logger.info("连接设备 %s: %s ...", dev_id, addr)
-        subprocess.run([ADB_CMD, "connect", addr], capture_output=True)
+        try:
+            subprocess.run([ADB_CMD, "connect", addr], capture_output=True, timeout=10)
+        except:
+            pass
         time.sleep(1)
-        # 同步设备到 AccountManager + 记录初始状态
-        connected = adb_op.ensure_connected(addr)
-        am.ensure_account(dev_id, addr, info.get("label", ""))
-        am.update_status(dev_id, status="online" if connected else "offline")
+        try:
+            connected = adb_op.ensure_connected(addr)
+            am.ensure_account(dev_id, addr, info.get("label", ""))
+            am.update_status(dev_id, status="online" if connected else "offline")
+        except Exception as e:
+            logger.error("设备 %s 初始化失败: %s", dev_id, e)
+    logger.info("设备注册完成: %s", json.dumps(DEVICES, ensure_ascii=False))
 
+if __name__ == "__main__":
+    # AccountManager 初始化时自动建表
+    logger.info("数据库已初始化: %s", os.environ.get("DB_PATH", "/app/data/bridge.db"))
     logger.info("设备注册表: %s", json.dumps(DEVICES, ensure_ascii=False))
+
+    # 后台连接设备（不阻塞 Flask 启动）
+    threading.Thread(target=_startup_connect_devices, daemon=True, name="startup-connect").start()
 
     # 启动自动回复巡检线程
     _loop_thread = threading.Thread(target=_auto_reply_loop, daemon=True, name="auto-reply-loop")
