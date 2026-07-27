@@ -60,9 +60,10 @@ services:
     network_mode: host
     volumes:
       - ./data:/app/data
+      - ./config:/root/line-crm/config:ro
     environment:
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
-      - DISABLED_DEVICES=cloud-02,cloud-03,cloud-05
+      - DISABLED_DEVICES=${DISABLED_DEVICES}
       - AUTO_REPLY_ENABLED=false
       - TZ=Asia/Taipei
     healthcheck:

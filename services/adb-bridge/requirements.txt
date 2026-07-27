@@ -2,3 +2,4 @@ flask==3.1.0
 gunicorn==23.0.0
 uiautomator2==3.4.2
 waitress
+pyyaml>=6.0
