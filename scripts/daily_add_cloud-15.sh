@@ -3,7 +3,7 @@ sleep $((RANDOM % 30))
 TARGETS="/root/targets_all.txt"
 BRIDGE="http://127.0.0.1:8899"
 GREETING_FILE="/root/line-crm/config/greetings.txt"
-DEVICE="cloud-02"
+DEVICE="cloud-15"
 DAILY_GOAL=10
 LOG="/root/line-crm/logs/daily_add.log"
 POSFILE="/root/line-crm/data/state/targets_position_shared"
