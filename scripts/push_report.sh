@@ -21,7 +21,8 @@ for dev in cloud-01 cloud-04 cloud-05 cloud-06 cloud-07 cloud-08 cloud-09 cloud-
     ok=$(echo "$dev_log" | grep -c "✅.*$dev")
     nf=$(echo "$dev_log" | grep -c "⏭.*$dev")
     fl=$(echo "$dev_log" | grep -c "❌.*$dev")
-    if echo "$dev_log" | grep -q "搜索次数达上限"; then st="🛑"
+    if echo "$dev_log" | grep -q "已冷却3次仍上限"; then st="🔁"
+    elif echo "$dev_log" | grep -q "搜索次数达上限"; then st="🛑"
     elif echo "$dev_log" | grep -q "连续失败.*停止"; then st="❌"
     elif echo "$dev_log" | grep -q "完成：成功"; then st="✅"
     else st="⏳"; fi
