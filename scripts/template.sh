@@ -11,8 +11,8 @@ LOCKFILE="/tmp/add_position.lock"
 MAX_FAIL=10
 LIMIT_FILE="/root/line-crm/data/state/device_limit_status.json"
 ALERT_FILE="/root/line-crm/data/state/alerts.txt"
-COOLDOWN_DAYS=2
-MAX_COOLDOWNS=3
+COOLDOWN_DAYS=5
+MAX_COOLDOWNS=2
 
 # ─── 检查设备是否在冷却期 ───
 check_cooldown() {
@@ -62,7 +62,6 @@ except: print(0)
 
 # ─── 标记设备达上限 ───
 mark_search_limit() {
-    local retry_after_cooldown="$1"  # "yes" 表示冷却后重试又秒毙
     python3 -c "
 import json, os
 from datetime import datetime, timedelta
@@ -81,10 +80,6 @@ if os.path.exists('$LIMIT_FILE'):
 dev = data.get('$DEVICE', {})
 prev_count = dev.get('cooldown_count', 0)
 count = prev_count + 1
-
-# 冷却后重试第一把就上限 → 不额外消耗次数，直接延冷却
-if '$retry_after_cooldown' == 'yes':
-    count = prev_count  # 不额外计数，当上次冷却无效
 
 if count >= max_cooldowns:
     dev = {'status': 'needs_replacement', 'cooldown_count': count,
