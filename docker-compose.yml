@@ -78,6 +78,31 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # ==============================
+  # Monitor Agent — 中央监控上报代理（只读采集，不控制业务）
+  # ==============================
+  monitor-agent:
+    build: ./services/monitor-agent
+    image: openclaw-monitor-agent:local
+    container_name: openclaw-monitor-agent
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    volumes:
+      - ./data:/data:ro
+      - ./config:/config:ro
+      # High risk：docker.sock 只读挂载，agent 代码仅允许 GET /containers/json
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /:/host:ro
+    environment:
+      - MONITOR_CONFIG=/config/monitor.yaml
+      - TZ=Asia/Taipei
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 networks:
   openclaw-net:
     driver: bridge

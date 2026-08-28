@@ -5,7 +5,7 @@ ADB Bridge v2 — 多设备支持
 分层架构:
   main.py (业务层) → Scheduler → AccountManager → AdbOperator → 手机
 """
-import subprocess, json, time, re, base64, logging, requests, os
+import subprocess, json, time, re, base64, logging, requests, os, uuid
 import uiautomator2 as u2
 from flask import Flask, request, jsonify
 
@@ -52,6 +52,61 @@ def _resolve_device() -> tuple[str, str]:
     return device_id, adb_op.get_device_addr(device_id)
 
 
+
+
+# ─── 监控事件队列（中央监控 P1）───────────────────────────────────────────
+# 只追加写 data/state/monitor_events.jsonl；monitor-agent tail 后注入
+# server_id 上传。此函数绝不能抛异常影响业务。
+MONITOR_EVENTS_PATH = os.environ.get(
+    "MONITOR_EVENTS_PATH", "/app/data/state/monitor_events.jsonl"
+)
+# 进程内互斥锁：避免 Flask 多线程并发 append 时 JSONL 行交叉损坏（不引入文件锁/外部依赖）
+_monitor_events_lock = threading.Lock()
+
+# JSONL 轮转阈值（字节）。写满后 rename 成 .1 再继续写，避免无界增长。
+# monitor-agent 已按路径重开 + 处理 size<offset，rename 轮转对其透明。
+MONITOR_EVENTS_MAX_BYTES = int(os.environ.get("MONITOR_EVENTS_MAX_BYTES", 100 * 1024 * 1024))
+MONITOR_EVENTS_ROTATED_SUFFIX = ".1"
+
+
+def _maybe_rotate():
+    """按大小轮转 JSONL：超阈值则 rename 原名 → 原名.1（保留一份，覆盖旧 .1）。
+
+    必须在 _monitor_events_lock 内调用（与 append 互斥）；任何异常吞掉，不影响业务。
+    """
+    try:
+        if os.path.getsize(MONITOR_EVENTS_PATH) >= MONITOR_EVENTS_MAX_BYTES:
+            rotated = MONITOR_EVENTS_PATH + MONITOR_EVENTS_ROTATED_SUFFIX
+            if os.path.exists(rotated):
+                os.remove(rotated)
+            os.rename(MONITOR_EVENTS_PATH, rotated)
+    except OSError:
+        pass
+
+
+def append_event(event_type, payload):
+    """追加一条监控事件到 JSONL 队列（event_id 由 main.py 生成，agent 不得修改）。
+
+    任何异常都必须吞掉，绝不能影响业务请求。
+    """
+    try:
+        line = json.dumps(
+            {
+                "event_id": str(uuid.uuid4()),
+                "event_type": event_type,
+                "ts": time.time(),
+                "payload": payload,
+            },
+            ensure_ascii=False,
+        )
+        # 确保父目录存在（首条事件前 /app/data/state 可能尚未创建）
+        os.makedirs(os.path.dirname(MONITOR_EVENTS_PATH), exist_ok=True)
+        with _monitor_events_lock:
+            _maybe_rotate()
+            with open(MONITOR_EVENTS_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:
+        logger.exception("append_event 写入失败: event_type=%s", event_type)
 
 
 # ═══════════════════════════════════════════
@@ -162,6 +217,10 @@ def health():
         am.ensure_account(dev_id, info["addr"], info.get("label", ""))
         am.update_status(dev_id,
                          status="online" if r.get("connected") else "offline")
+        # 监控事件：device_status（仅 online 维度）——只追加事件，不改上面业务逻辑
+        append_event("device_status",
+                     {"device_id": dev_id,
+                      "online_status": "online" if r.get("connected") else "offline"})
     return jsonify({
         "ok": all_ok,
         "status": "live" if all_ok else "degraded",

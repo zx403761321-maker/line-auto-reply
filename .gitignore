@@ -9,6 +9,7 @@ config/personas.yaml
 config/settings.yaml
 config/accounts.yaml
 config/devices.json
+config/monitor.yaml
 
 # ─── 客户数据（绝不能提交） ───
 data/state/
@@ -22,6 +23,9 @@ data/*.db*
 # ─── 日志 ───
 logs/
 *.log
+
+# ─── 日报（每台服务器各自运行） ───
+reports/
 
 # ─── 运行时数据 ───
 __pycache__/
