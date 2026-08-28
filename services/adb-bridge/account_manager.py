@@ -111,6 +111,7 @@ class AccountManager:
             for col, col_def in [
                 ("today_not_found", "INTEGER DEFAULT 0"),
                 ("risk_score", "INTEGER DEFAULT 0"),
+                ("daily_date", "TEXT"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE account_status ADD COLUMN {col} {col_def}")
@@ -624,45 +625,37 @@ class AccountManager:
     # ─── 每日重置 ───
 
     def _maybe_reset_daily(self, device_id: str):
-        """如果跨天了，自动重置每日计数器"""
+        """如果跨天了，自动重置每日计数器。
+
+        跨天判断用 daily_date 日期标记，不依赖 updated_at——
+        updated_at 会被 /health 每 30s 经 update_status 刷成「现在」，
+        旧实现（updated_at < 今天00:00）永不成立，导致每日计数从不归零。
+        """
         try:
             conn = self._get_conn()
             row = conn.execute(
-                "SELECT daily_reset_at, updated_at FROM account_status "
+                "SELECT daily_date FROM account_status "
                 "WHERE device_id = ?", (device_id,)).fetchone()
             if not row:
                 return
-            reset_at = row["daily_reset_at"] or "00:00"
-            last_updated = row["updated_at"]
-            if not last_updated:
-                return
 
-            # 解析 reset_at 为今天的小时和分钟
-            parts = reset_at.split(":")
-            reset_hour = int(parts[0]) if parts else 0
-            reset_min = int(parts[1]) if len(parts) > 1 else 0
+            today = time.strftime("%Y-%m-%d", time.localtime(time.time()))
+            if row["daily_date"] == today:
+                return  # 今天已重置过，无需重复
 
-            now = time.localtime(time.time())
-            last = time.localtime(last_updated)
-
-            # 判断是否跨了重置点（用日期比较：last < today_reset 且 now >= today_reset）
-            today_reset_ts = time.mktime((
-                now.tm_year, now.tm_mon, now.tm_mday,
-                reset_hour, reset_min, 0,
-                now.tm_wday, now.tm_yday, now.tm_isdst))
-
-            if last_updated < today_reset_ts <= time.time():
-                conn.execute("""
-                    UPDATE account_status
-                    SET daily_success = 0, daily_fail = 0, daily_search = 0,
-                        today_not_found = 0,
-                        -- search_limit 状态跨天自动恢复
-                        status = CASE WHEN status = 'search_limit' THEN 'active' ELSE status END,
-                        cooldown_until = CASE WHEN status = 'search_limit' THEN NULL ELSE cooldown_until END,
-                        updated_at = ?
-                    WHERE device_id = ?
-                """, (time.time(), device_id))
-                conn.commit()
+            # 跨天（或存量数据 daily_date 为 NULL）→ 归零每日计数并标记今天
+            conn.execute("""
+                UPDATE account_status
+                SET daily_success = 0, daily_fail = 0, daily_search = 0,
+                    today_not_found = 0,
+                    daily_date = ?,
+                    -- search_limit 状态跨天自动恢复
+                    status = CASE WHEN status = 'search_limit' THEN 'active' ELSE status END,
+                    cooldown_until = CASE WHEN status = 'search_limit' THEN NULL ELSE cooldown_until END,
+                    updated_at = ?
+                WHERE device_id = ?
+            """, (today, time.time(), device_id))
+            conn.commit()
         except Exception:
             pass
 
@@ -670,16 +663,18 @@ class AccountManager:
         """手动重置每日计数"""
         try:
             conn = self._get_conn()
+            today = time.strftime("%Y-%m-%d", time.localtime(time.time()))
             conn.execute("""
                 UPDATE account_status
                 SET daily_success = 0, daily_fail = 0, daily_search = 0,
                     today_not_found = 0,
+                    daily_date = ?,
                     -- 如果只是 search_limit 状态，跨天恢复
                     status = CASE WHEN status = 'search_limit' THEN 'active' ELSE status END,
                     cooldown_until = CASE WHEN status = 'search_limit' THEN NULL ELSE cooldown_until END,
                     updated_at = ?
                 WHERE device_id = ?
-            """, (time.time(), device_id))
+            """, (today, time.time(), device_id))
             conn.commit()
             return True
         except Exception:

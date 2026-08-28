@@ -387,6 +387,62 @@ class TestAccountManager(DbTestBase):
         self.assertEqual(acc['status'], 'active')
         self.assertIsNone(acc['cooldown_until'])
 
+    def test_maybe_reset_daily_legacy_null(self):
+        """存量数据 daily_date=NULL → 第一次 check 归零并标记今天"""
+        self.am.ensure_account('cloud-01', '1.1.1.1:5555')
+        conn = self.am._get_conn()
+        conn.execute(
+            "UPDATE account_status SET daily_success=10, daily_fail=5, "
+            "daily_search=40, today_not_found=3, daily_date=NULL "
+            "WHERE device_id='cloud-01'")
+        conn.commit()
+        self.am._maybe_reset_daily('cloud-01')
+        acc = self.am.get('cloud-01')
+        self.assertEqual(acc['daily_success'], 0)
+        self.assertEqual(acc['daily_fail'], 0)
+        self.assertEqual(acc['daily_search'], 0)
+        self.assertEqual(acc['today_not_found'], 0)
+        self.assertEqual(acc['daily_date'],
+                         time.strftime("%Y-%m-%d", time.localtime(time.time())))
+
+    def test_maybe_reset_daily_same_day_no_repeat(self):
+        """daily_date=今天 → 不重复重置，计数保留"""
+        self.am.ensure_account('cloud-01', '1.1.1.1:5555')
+        conn = self.am._get_conn()
+        today = time.strftime("%Y-%m-%d", time.localtime(time.time()))
+        conn.execute(
+            "UPDATE account_status SET daily_success=10, daily_fail=5, "
+            "daily_search=40, today_not_found=3, daily_date=? "
+            "WHERE device_id='cloud-01'", (today,))
+        conn.commit()
+        self.am._maybe_reset_daily('cloud-01')
+        acc = self.am.get('cloud-01')
+        self.assertEqual(acc['daily_success'], 10)
+        self.assertEqual(acc['daily_fail'], 5)
+        self.assertEqual(acc['daily_search'], 40)
+        self.assertEqual(acc['today_not_found'], 3)
+        self.assertEqual(acc['daily_date'], today)
+
+    def test_maybe_reset_daily_cross_day(self):
+        """daily_date=昨天 → 跨天归零并标记今天"""
+        self.am.ensure_account('cloud-01', '1.1.1.1:5555')
+        conn = self.am._get_conn()
+        yesterday = time.strftime("%Y-%m-%d",
+                                  time.localtime(time.time() - 86400))
+        conn.execute(
+            "UPDATE account_status SET daily_success=10, daily_fail=5, "
+            "daily_search=40, today_not_found=3, daily_date=? "
+            "WHERE device_id='cloud-01'", (yesterday,))
+        conn.commit()
+        self.am._maybe_reset_daily('cloud-01')
+        acc = self.am.get('cloud-01')
+        self.assertEqual(acc['daily_success'], 0)
+        self.assertEqual(acc['daily_fail'], 0)
+        self.assertEqual(acc['daily_search'], 0)
+        self.assertEqual(acc['today_not_found'], 0)
+        self.assertEqual(acc['daily_date'],
+                         time.strftime("%Y-%m-%d", time.localtime(time.time())))
+
     # ─── 统计 ───
 
     def test_get_stats(self):
