@@ -96,6 +96,11 @@ class AccountManager:
                     max_consecutive_fails  INTEGER DEFAULT 10,
                     cooldown_minutes       INTEGER DEFAULT 30,
 
+                    -- 搜索上限冷却机制
+                    search_limit_count      INTEGER DEFAULT 0,
+                    search_limit_max        INTEGER DEFAULT 3,
+                    search_cooldown_days    INTEGER DEFAULT 5,
+
                     -- 累计统计
                     total_add_attempts  INTEGER DEFAULT 0,
                     total_add_success   INTEGER DEFAULT 0,
@@ -112,6 +117,9 @@ class AccountManager:
                 ("today_not_found", "INTEGER DEFAULT 0"),
                 ("risk_score", "INTEGER DEFAULT 0"),
                 ("daily_date", "TEXT"),
+                ("search_limit_count", "INTEGER DEFAULT 0"),
+                ("search_limit_max", "INTEGER DEFAULT 3"),
+                ("search_cooldown_days", "INTEGER DEFAULT 5"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE account_status ADD COLUMN {col} {col_def}")
@@ -229,6 +237,26 @@ class AccountManager:
                 vals)
             conn.commit()
             return True
+        except Exception:
+            return False
+
+    def update_connectivity(self, device_id: str, online: bool) -> bool:
+        """
+        更新在线状态（online/offline）。
+        处于冷却/死/封/登录异常等语义状态时不覆盖，避免 /health 把冷却状态冲掉。
+        """
+        try:
+            self._maybe_reset_daily(device_id)
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT status FROM account_status WHERE device_id = ?",
+                (device_id,)).fetchone()
+            if row and row["status"] in (
+                    "cooldown", "search_limit", "dead", "banned",
+                    "disabled", "login_error", "paused"):
+                return False  # 语义状态优先，不覆盖
+            return self.update_status(device_id,
+                status="online" if online else "offline")
         except Exception:
             return False
 
@@ -438,15 +466,41 @@ class AccountManager:
     # ─── 状态更新动作 ───
 
     def _apply_search_limit(self, device_id: str):
-        """搜索次数达上限 → status=search_limit, 冷却到明天"""
-        tomorrow = self._tomorrow_reset_ts(device_id)
-        self.update_status(device_id,
-            status="search_limit",
-            cooldown_until=tomorrow,
-            cooldown_reason="搜索次数已达上限",
-            last_error="search_limit",
-            last_error_at=time.time())
-        self._adjust_risk(device_id, +30)
+        """
+        搜索次数达上限 → 进入冷却期（默认 search_cooldown_days=5 天）。
+        冷却次数累计，达到 search_limit_max（默认 3）次后判死（status=dead）。
+        """
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT search_limit_count, search_limit_max, search_cooldown_days "
+            "FROM account_status WHERE device_id = ?", (device_id,)).fetchone()
+        if not row:
+            return
+        count = (row["search_limit_count"] or 0) + 1
+        max_count = row["search_limit_max"] or 3
+        days = row["search_cooldown_days"] or 5
+
+        if count >= max_count:
+            # 冷却次数用尽 → 判死
+            self.update_status(device_id,
+                status="dead",
+                cooldown_until=None,
+                cooldown_reason=f"搜索上限达{count}次，判死",
+                search_limit_count=count,
+                last_error="search_limit_dead",
+                last_error_at=time.time())
+            self._adjust_risk(device_id, +50)
+        else:
+            # 进入冷却期
+            until = time.time() + days * 86400
+            self.update_status(device_id,
+                status="cooldown",
+                cooldown_until=until,
+                cooldown_reason=f"搜索次数达上限（第{count}次冷却）",
+                search_limit_count=count,
+                last_error="search_limit",
+                last_error_at=time.time())
+            self._adjust_risk(device_id, +30)
 
     def _apply_login_error(self, device_id: str, error: str):
         """登录失败 → status=login_error"""
@@ -557,6 +611,36 @@ class AccountManager:
             return (True, "ok")
         except Exception:
             return (True, "ok")  # DB 故障时放行，不阻塞业务
+
+    def check_blocked(self, device_id: str) -> tuple[bool, str]:
+        """
+        检查设备是否处于硬阻断状态（死/封/禁/登录异常/冷却中）。
+        冷却期满会自动恢复 active。
+        返回 (is_blocked, reason)。reason 为空字符串表示未阻断。
+        """
+        try:
+            self._maybe_reset_daily(device_id)
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT status, cooldown_until FROM account_status "
+                "WHERE device_id = ?", (device_id,)).fetchone()
+            if not row:
+                return (False, "")
+            status = row["status"]
+            if status in ("banned", "disabled", "login_error", "dead"):
+                return (True, status)
+            if status == "cooldown":
+                until = row["cooldown_until"]
+                if until and until > time.time():
+                    return (True, "cooldown")
+                # 冷却期满，自动恢复 active
+                self.exit_cooldown(device_id)
+                return (False, "")
+            if status == "search_limit":
+                return (True, "search_limit")  # 兼容旧状态
+            return (False, "")
+        except Exception:
+            return (False, "")
 
     def can_search(self, device_id: str) -> tuple[bool, str]:
         """判断能否继续搜索（检查 status + 每日搜索上限）"""

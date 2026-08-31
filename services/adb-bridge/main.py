@@ -215,8 +215,7 @@ def health():
     for dev_id, info in DEVICES.items():
         r = results.get(dev_id, {})
         am.ensure_account(dev_id, info["addr"], info.get("label", ""))
-        am.update_status(dev_id,
-                         status="online" if r.get("connected") else "offline")
+        am.update_connectivity(dev_id, bool(r.get("connected")))
         # 监控事件：device_status（仅 online 维度）——只追加事件，不改上面业务逻辑
         append_event("device_status",
                      {"device_id": dev_id,
@@ -334,6 +333,13 @@ def line_add_friend_by_id():
     line_id = data["line_id"]
     message = data.get("message", "你好，我是貸款顧問")
     device_id, device_addr = _resolve_device()
+
+    # 调度守卫：冷却/判死/封禁等状态直接拒绝，不碰 ADB
+    blocked, reason = am.check_blocked(device_id)
+    if blocked:
+        detail = (am.get(device_id) or {}).get("cooldown_reason", "")
+        return jsonify({"ok": False, "error": reason, "detail": detail})
+
     t_start = time.time()
     lock = get_device_lock(device_addr)
     if not lock.acquire(blocking=False):
@@ -1077,7 +1083,7 @@ def _startup_connect_devices():
         try:
             connected = adb_op.ensure_connected(addr)
             am.ensure_account(dev_id, addr, info.get("label", ""))
-            am.update_status(dev_id, status="online" if connected else "offline")
+            am.update_connectivity(dev_id, connected)
         except Exception as e:
             logger.error("设备 %s 初始化失败: %s", dev_id, e)
     logger.info("设备注册完成: %s", json.dumps(DEVICES, ensure_ascii=False))
