@@ -419,8 +419,8 @@ def line_add_friend_by_id():
         time.sleep(0.5)
         steps.append("type_id")
 
-        # 6. 点「搜索」按钮 @(650,356)
-        adb_op.adb(device_addr, "shell", "input", "tap", "650", "356")
+        # 6. 触发搜索 — 26.14.0 移除了「搜索」按钮（(650,356) 变成清空键），改用回车 IME 搜索动作，旧版同样响应
+        adb_op.adb(device_addr, "shell", "input", "keyevent", "66")
         time.sleep(3)
         steps.append("search")
 
@@ -438,18 +438,22 @@ def line_add_friend_by_id():
                 return jsonify({"ok": False, "steps": steps, "line_id": line_id,
                                 "error": "search_limit",
                                 "detail": f"搜索次数已达上限（匹配关键词: {kw}）"})
-        # 点击「添加」
-        if not adb_op.ui_tap(device_addr, "添加", timeout=2):
+        # 点击「添加」— 用 u2 按 resource-id 定位（26.14.0 起 shell uiautomator dump 被 SIGKILL，ui_tap 失效）
+        add_btn = xd(resourceId="jp.naver.line.android:id/addfriend_add_button")
+        if add_btn.exists(timeout=2):
+            add_btn.click()
+            steps.append("tap_add")
+        else:
             adb_op.adb(device_addr, "shell", "input", "tap", "360", "834")
             time.sleep(1)
             steps.append("tap_add_xy")
-        else:
-            steps.append("tap_add")
         time.sleep(1.5)
 
-        # 8. 二次确认
-        adb_op.ui_tap(device_addr, "添加", timeout=1)
-        time.sleep(0.5)
+        # 8. 二次确认（仅当仍存在「添加」按钮时；26.14.0 一次即加好友，无确认弹窗）
+        confirm_btn = xd(text="添加")
+        if confirm_btn.exists(timeout=1):
+            confirm_btn.click()
+            time.sleep(0.5)
         steps.append("confirm_add")
 
         # 写映射{LINE_ID: LINE_ID}
