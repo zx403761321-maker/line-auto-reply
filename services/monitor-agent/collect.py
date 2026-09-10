@@ -123,7 +123,7 @@ def collect_snapshot(sqlite_db, device_limit_path):
         conn = sqlite3.connect(f"file:{sqlite_db}?mode=ro", uri=True, timeout=5)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT device_id, daily_success, daily_fail, risk_score, last_task_at "
+            "SELECT device_id, daily_success, daily_fail, risk_score, last_task_at, daily_date "
             "FROM account_status"
         ).fetchall()
         conn.close()
@@ -134,6 +134,7 @@ def collect_snapshot(sqlite_db, device_limit_path):
                 "today_fail": r["daily_fail"] or 0,
                 "risk_score": r["risk_score"] or 0,
                 "last_task_at": r["last_task_at"],
+                "daily_date": r["daily_date"],
                 "cooldown_count": 0,
                 "cooldown_until": None,
                 "needs_replacement": False,
@@ -154,6 +155,7 @@ def collect_snapshot(sqlite_db, device_limit_path):
                     "today_fail": 0,
                     "risk_score": 0,
                     "last_task_at": None,
+                    "daily_date": None,
                 },
             )
             d["cooldown_count"] = info.get("cooldown_count", 0)
