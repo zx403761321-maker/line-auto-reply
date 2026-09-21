@@ -1,0 +1,42 @@
+# 二次触达（followup）配置
+followup:
+  enabled: true          # 总开关
+  max_attempts: 2        # 失败重试上限，达到后转 FOLLOWUP_FAILED
+  max_per_run: 3         # 每轮最多处理条数
+
+  # 全局运行窗口（Asia/Taipei）：仅在 [8, 22) 内运行，22:00 后不跑任何 followup。
+  run_hours: [8, 22]
+
+  # 自然日基准天数：首次问候所在自然日 + base_delay_days 个自然日 起才可触达。
+  # 仅作「基准」；每台设备的实际到期日由下方 followup_schedule 的 day_offset 决定（可覆盖）。
+  # 不要写死 7：后续可改 1/2/3/5/7 …，代码只读此配置。
+  base_delay_days: 7
+
+  # 二次问候消息文件：与首次问候共用 config/greetings.txt（两次文案一致）
+  messages_file: /root/line-crm/config/greetings.txt
+
+  # 失败截图落盘目录（容器内路径，对应宿主 /root/line-crm/data）
+  screenshot_dir: /app/data/state/followup_shots
+
+  # 正向发送时刻表（自然日 + 组别顺延 +1）：
+  #   send_start = 首次问候「Taipei 自然日零点」 + day_offset 自然日 + start_hour 整点
+  #   组1(原加好友 08-12) → 顺延到 组2 时段 12-17：day_offset=7, start_hour=12
+  #   组2(原加好友 12-17) → 顺延到 组3 时段 17-22：day_offset=7, start_hour=17
+  #   组3(原加好友 17-22) → 顺延到 次日组1 时段 08-12：day_offset=8, start_hour=8
+  # 15 台设备全部在表内参与 followup。
+  followup_schedule:
+    cloud-01: {start_hour: 12, day_offset: 7}
+    cloud-02: {start_hour: 12, day_offset: 7}
+    cloud-03: {start_hour: 12, day_offset: 7}
+    cloud-04: {start_hour: 12, day_offset: 7}
+    cloud-05: {start_hour: 12, day_offset: 7}
+    cloud-06: {start_hour: 17, day_offset: 7}
+    cloud-07: {start_hour: 17, day_offset: 7}
+    cloud-08: {start_hour: 17, day_offset: 7}
+    cloud-09: {start_hour: 17, day_offset: 7}
+    cloud-10: {start_hour: 17, day_offset: 7}
+    cloud-11: {start_hour: 8,  day_offset: 8}
+    cloud-12: {start_hour: 8,  day_offset: 8}
+    cloud-13: {start_hour: 8,  day_offset: 8}
+    cloud-14: {start_hour: 8,  day_offset: 8}
+    cloud-15: {start_hour: 8,  day_offset: 8}

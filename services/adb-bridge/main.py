@@ -13,6 +13,8 @@ from logger import device_log, device_error, system_log, timed
 from account_manager import AccountManager
 from adb_operator import AdbOperator
 from scheduler import Scheduler
+from db import record_first_greeting_success, get_first_contact
+from followup import FollowupWorker
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [adb-bridge] %(message)s")
@@ -50,6 +52,10 @@ def _resolve_device() -> tuple[str, str]:
     if not device_id:
         device_id = list(DEVICES.keys())[0]  # fallback
     return device_id, adb_op.get_device_addr(device_id)
+
+
+# 二次触达 worker（独立模块，与首次添加好友任务隔离，复用进程内设备锁）
+followup_worker = FollowupWorker(adb_op, get_device_lock)
 
 
 
@@ -347,6 +353,9 @@ def line_add_friend_by_id():
     try:
         adb_op.ensure_connected(device_addr)
         steps = []
+        greeted = False   # 首次问候是否真正发送成功
+        renamed_ok = False    # 好友备注是否已保存为 LINE ID
+        logger.info("[CONTACT] device=%s line_id=%s flow=add_first_contact start", device_id, line_id)
 
         # 1. 强制重启 LINE → u2找主页Tab精准点击
         adb_op.adb(device_addr, "shell", "am", "force-stop", LINE_PACKAGE)
@@ -491,8 +500,25 @@ def line_add_friend_by_id():
                     time.sleep(1)
                     steps.append("greeted")
 
+                    # 确认首次问候真正发送成功：发送后输入框应被清空
+                    try:
+                        _u2_cache.pop(device_addr, None)
+                        dchk = adb_op.get_u2(device_addr)
+                        edit_el = dchk(resourceId="jp.naver.line.android:id/chat_ui_message_edit")
+                        if not edit_el.exists(timeout=2):
+                            edit_el = dchk(description="输入消息")
+                        if edit_el.exists(timeout=1):
+                            remaining = (edit_el.get_text() or "").strip()
+                            greeted = (remaining == "")
+                        else:
+                            greeted = True  # 读不到输入框，退回旧逻辑：已点发送即算成功
+                    except Exception:
+                        greeted = True
+                    steps.append("greeting_verified" if greeted else "greeting_verify_fail")
+                    logger.info("[CONTACT] device=%s line_id=%s friend_added=true greeted=%s",
+                                device_id, line_id, greeted)
+
                     # 10. 改好友名字为LINE ID
-                    renamed_ok = False
                     time.sleep(2)
                     # 用u2找顶部最宽可点元素=名字条
                     for el in d(clickable=True):
@@ -508,25 +534,57 @@ def line_add_friend_by_id():
                         except: pass
                     _u2_cache.pop(device_addr, None)
                     xd3 = adb_op.get_u2(device_addr)
-                    xd_xml = xd3.dump_hierarchy()
-                    if "修改名字" in xd_xml:
-                        m = re.search(r"(?:text|content-desc)=\"修改名字\"[^>]*bounds=\"\[(\d+),(\d+)\]\[(\d+),(\d+)\]\"", xd_xml)
-                        if m:
-                            cx = (int(m.group(1)) + int(m.group(3))) // 2
-                            cy = (int(m.group(2)) + int(m.group(4))) // 2
-                            adb_op.adb(device_addr, "shell", "input", "tap", str(cx), str(cy))
-                            time.sleep(1)
-                            adb_op.type_text(device_addr, line_id)
-                            time.sleep(0.5)
-                            adb_op.adb(device_addr, "shell", "input", "tap", "360", "1122")
-                            time.sleep(1)
-                            renamed_ok = True
+                    # 找「修改名字」入口（优先 resource-id，其次 text/description）
+                    edit_name_btn = xd3(resourceId="jp.naver.line.android:id/user_profile_edit_name")
+                    if not edit_name_btn.exists(timeout=2):
+                        edit_name_btn = xd3(text="修改名字")
+                    if not edit_name_btn.exists(timeout=1):
+                        edit_name_btn = xd3(description="修改名字")
+                    if edit_name_btn.exists(timeout=2):
+                        edit_name_btn.click()
+                        time.sleep(1)
+                        adb_op.type_text(device_addr, line_id)
+                        time.sleep(0.5)
+                        # 用 UI 节点定位「保存」按钮（resource-id 稳定，不受讯飞键盘弹起影响）
+                        save_btn = xd3(resourceId="jp.naver.line.android:id/save_button")
+                        if not save_btn.exists(timeout=2):
+                            save_btn = xd3(text="保存")
+                        if save_btn.exists(timeout=3):
+                            save_btn.click()
+                            time.sleep(1.5)
                             steps.append("renamed")
+                            # 验证备注已保存：保存后回到资料页 name == line_id（用 u2 节点读取，避免 XML 属性顺序导致的误判）
+                            try:
+                                _u2_cache.pop(device_addr, None)
+                                xchk = adb_op.get_u2(device_addr)
+                                name_el = xchk(resourceId="jp.naver.line.android:id/user_profile_name")
+                                saved_name = (name_el.get_text() or "").strip() if name_el.exists(timeout=2) else ""
+                                renamed_ok = (saved_name == line_id)
+                            except Exception:
+                                renamed_ok = False
+                            steps.append("remark_verified" if renamed_ok else "remark_verify_fail")
+                        else:
+                            steps.append("save_btn_not_found")
+                    else:
+                        steps.append("edit_name_not_found")
                     if not renamed_ok:
                         steps.append("rename_fail")
+                    logger.info("[CONTACT] device=%s line_id=%s renamed_ok=%s",
+                                device_id, line_id, renamed_ok)
 
-                    if not renamed_ok:
-                        steps.append("rename_fail")
+                    # 11. 首次问候 + 备注均成功后，记录首次触达（独立阶段，幂等）
+                    if greeted and renamed_ok:
+                        db_ok = record_first_greeting_success(device_id, line_id, "WAITING_FOLLOWUP")
+                        if db_ok:
+                            steps.append("first_contact_recorded")
+                            logger.info("[CONTACT] device=%s line_id=%s first_contact_recorded=true status=WAITING_FOLLOWUP",
+                                        device_id, line_id)
+                        else:
+                            steps.append("db_record_failed")
+                            logger.error("[CONTACT] device=%s line_id=%s first_contact_recorded=false reason=db_write_fail",
+                                         device_id, line_id)
+                    else:
+                        steps.append("not_recorded")
                 else:
                     steps.append("send_fail")
             else:
@@ -539,9 +597,20 @@ def line_add_friend_by_id():
         last_step = steps[-1] if steps else "none"
         device_log(device_addr, "add_friend", duration_ms=dt_ms,
                    line_id=line_id[:20], steps=len(steps), last_step=last_step)
-        # 通过 AccountManager 上报结果
+        # 首次触达结果汇总日志（区分失败阶段）
+        if greeted and renamed_ok:
+            contact_status = "SUCCESS"
+        elif not greeted and renamed_ok:
+            contact_status = "GREETING_FAILED"
+        elif greeted and not renamed_ok:
+            contact_status = "REMARK_FAILED"
+        else:
+            contact_status = "ADD_FAILED"
+        logger.info("[CONTACT] device=%s line_id=%s result=%s greeted=%s renamed_ok=%s last_step=%s",
+                    device_id, line_id, contact_status, greeted, renamed_ok, last_step)
+        # 通过 AccountManager 上报结果（成功=首次问候已确认发送且备注已确认保存）
         am.report(device_id, {
-            "ok": last_step in ("greeted", "renamed"),
+            "ok": (greeted and renamed_ok),
             "task_type": "add_friend",
             "steps": steps,
             "last_step": last_step,
@@ -551,6 +620,27 @@ def line_add_friend_by_id():
         })
         lock.release()
     return jsonify({"ok": True, "steps": steps, "line_id": line_id, "device": device_addr})
+
+
+@app.route("/followup/run", methods=["POST"])
+def followup_run():
+    """二次触达调度入口。
+    - 无参：跑到期任务（run_due：时窗检查 + claim + 设备锁）
+    - ?device=X&line_id=Y：测试模式，强制跑单条（忽略到期时间，用于单设备/异常测试）
+    """
+    device_id = request.args.get("device")
+    line_id = request.args.get("line_id")
+    if device_id and line_id:
+        rec = get_first_contact(device_id, line_id)
+        if rec is None:
+            return jsonify({"ok": False, "error": "no_such_record",
+                            "device": device_id, "line_id": line_id})
+        r = followup_worker.run_one(rec, force=True)
+        r["device"] = device_id
+        r["line_id"] = line_id
+        return jsonify({"ok": True, "mode": "test", "result": r})
+    r = followup_worker.run_due()
+    return jsonify({"ok": True, "mode": "due", **r})
 
 
 @app.route("/line/check-latest-chat", methods=["POST"])
