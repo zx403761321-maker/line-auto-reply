@@ -12,7 +12,7 @@ MAX_FAIL=10
 LIMIT_FILE="/root/line-crm/data/state/device_limit_status.json"
 ALERT_FILE="/root/line-crm/data/state/alerts.txt"
 COOLDOWN_DAYS=5
-MAX_COOLDOWNS=2
+MAX_COOLDOWNS=3  # 判死阈值：连续3次触顶（第1次→冷却，重试→第2次冷却，再重试触顶→判死）
 
 # ─── 检查设备是否在冷却期 ───
 check_cooldown() {

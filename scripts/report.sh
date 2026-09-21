@@ -66,6 +66,8 @@ for dev in cloud-{01,02,03,04,05,06,07,08,09,10,11,12,13,14,15}; do
     # 状态判断
     if echo "$dev_log" | grep -q "已冷却3次仍上限"; then
         st="🔁 需换号"
+    elif echo "$dev_log" | grep -q "冷却中"; then
+        st="🧊 冷却中"
     elif echo "$dev_log" | grep -q "搜索次数达上限"; then
         st="🛑 搜索上限"
     elif echo "$dev_log" | grep -q "连续失败.*停止"; then
@@ -98,7 +100,7 @@ for dev in cloud-{01,02,03,04,05,06,07,08,09,10,11,12,13,14,15}; do
 done
 
 # ─── 汇总 ───
-total_targets=$(wc -l < /root/targets_all.txt)
+total_targets=$(wc -l < /root/line-crm/data/targets/targets_all.txt)
 {
     echo ""
     echo "─────────────────────────────"

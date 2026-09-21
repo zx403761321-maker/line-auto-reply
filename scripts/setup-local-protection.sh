@@ -6,6 +6,7 @@ set -e
 echo "🔒 保护本地文件..."
 
 git update-index --skip-worktree config/settings.yaml
+git update-index --skip-worktree reports/daily.txt
 git update-index --skip-worktree data/leads/leads.jsonl
 git update-index --skip-worktree data/leads/loan_leads.txt
 git update-index --skip-worktree data/leads/贷款意向线索.txt
