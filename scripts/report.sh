@@ -64,7 +64,7 @@ for dev in cloud-{01,02,03,04,05,06,07,08,09,10,11,12,13,14,15}; do
     total_ok=$((total_ok + ok)); total_nf=$((total_nf + nf)); total_fail=$((total_fail + fl))
 
     # 状态判断
-    if echo "$dev_log" | grep -q "已冷却3次仍上限"; then
+    if echo "$dev_log" | grep -q "已判死"; then
         st="🔁 需换号"
     elif echo "$dev_log" | grep -q "冷却中"; then
         st="🧊 冷却中"
