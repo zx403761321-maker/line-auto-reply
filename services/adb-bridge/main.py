@@ -453,6 +453,19 @@ def line_add_friend_by_id():
             add_btn.click()
             steps.append("tap_add")
         else:
+            # 添加按钮缺失：搜索上限弹窗常在搜索后才弹出（首次 dump 未捕获到）。
+            # 重新 dump 一次再查，避免盲点坐标把「搜索上限」误判成 no_chat_yet。
+            xd_xml2 = xd.dump_hierarchy()
+            if "未找到" in xd_xml2:
+                steps.append("no_result")
+                return jsonify({"ok": False, "steps": steps, "line_id": line_id,
+                                "error": "未找到该用户"})
+            for kw in ["已达上限", "搜索次数", "过于频繁", "稍后再试", "限制", "暂时不能使用"]:
+                if kw in xd_xml2:
+                    steps.append("search_limit")
+                    return jsonify({"ok": False, "steps": steps, "line_id": line_id,
+                                    "error": "search_limit",
+                                    "detail": f"搜索次数已达上限（匹配关键词: {kw}）"})
             adb_op.adb(device_addr, "shell", "input", "tap", "360", "834")
             time.sleep(1)
             steps.append("tap_add_xy")
@@ -619,7 +632,18 @@ def line_add_friend_by_id():
             "duration_ms": dt_ms,
         })
         lock.release()
-    return jsonify({"ok": True, "steps": steps, "line_id": line_id, "device": device_addr})
+    success = (greeted and renamed_ok)
+    if not greeted and not renamed_ok:
+        error = "add_failed"
+    elif not greeted:
+        error = "greeting_failed"
+    elif not renamed_ok:
+        error = "remark_failed"
+    else:
+        error = ""
+    return jsonify({"ok": success, "error": error, "steps": steps,
+                    "greeted": greeted, "renamed_ok": renamed_ok,
+                    "line_id": line_id, "device": device_addr})
 
 
 @app.route("/followup/run", methods=["POST"])
