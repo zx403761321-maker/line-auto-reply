@@ -11,6 +11,7 @@ config/settings.yaml
 config/accounts.yaml
 config/devices.json
 config/monitor.yaml
+config/greetings.txt
 
 # ─── 生成物（由 make deploy 从 template.sh 生成，不入库） ───
 scripts/daily_add_cloud-*.sh
