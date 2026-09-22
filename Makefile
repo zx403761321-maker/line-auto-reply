@@ -28,11 +28,11 @@ logs:
 
 deploy:
 	@bash scripts/template.sh --check 2>/dev/null || { echo "❌ 模板语法错误"; exit 1; }
-	@for n in 01 02 03 04 05 06 07 08 09 10; do \
+	@for n in 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15; do \
 		sed "s/\$$1/cloud-$$n/" scripts/template.sh > scripts/daily_add_cloud-$$n.sh; \
 		chmod +x scripts/daily_add_cloud-$$n.sh; \
 	done
-	@git add scripts/ && git diff --cached --stat && echo "make commit 提交"
+	@echo "✅ 已生成 15 个 daily_add 脚本（本地生成物，不入库）"
 
 health:
 	@echo "=== Bridge ===" && curl -s --max-time 5 http://127.0.0.1:8899/health | python3 -m json.tool 2>/dev/null || echo "❌"

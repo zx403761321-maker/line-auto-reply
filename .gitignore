@@ -2,6 +2,7 @@
 .env
 *.key
 *_secret*
+config/bridge_token
 
 # ─── 每台服务器各自维护的本地配置 ───
 config/devices.yaml
@@ -10,6 +11,9 @@ config/settings.yaml
 config/accounts.yaml
 config/devices.json
 config/monitor.yaml
+
+# ─── 生成物（由 make deploy 从 template.sh 生成，不入库） ───
+scripts/daily_add_cloud-*.sh
 
 # ─── 客户数据（绝不能提交） ───
 data/state/
